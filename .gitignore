@@ -1,0 +1,19 @@
+# Byte-compiled / cache
+__pycache__/
+*.pyc
+
+# Logs
+logs/
+*.log
+
+# Generated data
+data/**/*.npy
+data/**/*.csv
+
+# Plots
+plots/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
