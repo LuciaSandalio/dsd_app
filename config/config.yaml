@@ -1,0 +1,47 @@
+cleanup:
+  directories:
+  - data/processed
+  - data/processed/events
+  - data/processed/matrices
+  - plots/heatmaps
+  - plots/hyetographs
+  - plots/intensity_plots
+  - plots/size_distributions
+  - plots/velocity_distributions
+  files:
+  - data/processed/output_data.csv
+  - data/processed/annotated_data.csv
+  - logs/get_dsdfile.log
+  - logs/event.log
+  - logs/visualization.log
+event:
+  annotated_csv_output: data/processed/annotated_data.csv
+  combined_matrix_directory: data/matrices/combined
+  csv_input: data/processed/output_data.csv
+  end_date: '2025-01-15'
+  event_directory: data/processed/events
+  intensidad_threshold: 0.0
+  log_file: logs/event.log
+  matrix_directory: data/processed/matrices
+  max_workers: 4
+  min_gap_hours: 2
+  output_csv_directory: data/matrices/combined_csvs
+  particulas_threshold: 0
+  start_date: '2025-01-02'
+get_dsdfile:
+  end_date: '2025-01-15'
+  log_file_path: logs/get_dsdfile.log
+  max_workers: 4
+  output_directory: data/processed
+  root_directory: data/raw
+  start_date: '2025-01-02'
+visualization:
+  annotated_csv: data/processed
+  combined_matrices_dir: data/matrices/combined
+  diam_vel_mapping_file: diam_vel_mapping.csv
+  end_date: '2025-01-15'
+  log_file_path: logs/visualization.log
+  plots_output_dir: plots
+  start_date: '2025-01-02'
+workflow:
+  log_file: logs/master_workflow.log

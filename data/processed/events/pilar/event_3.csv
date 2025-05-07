@@ -1,0 +1,2 @@
+Datetime,Timestamp,Nº de partículas,Temp Sensor,Temp cabezal derecho,Temp cabezal izquierdo,Corriente Calentador,Intensidad,Precipitacion,Reflectividad,Estado Sensor,MissingData,Precip_Active,Precip_Event
+2025-01-05 03:42:00,1736059320.0,17.0,20.0,23.0,24.0,0.12,0.042,0.03,6.786,0.0,False,True,3
