@@ -62,3 +62,10 @@ desktop.ini
 
 # ── Config local (no subir secretos) ──────────────────────────────────────────
 config/*.local.yaml
+src/scripts/caso_prueba.py
+src/scripts/gamma_plot.py
+src/scripts/gamma.py
+scripts/caso_prueba.py
+scripts/gamma_plot.py
+scripts/gamma.py
+dash_app.py
