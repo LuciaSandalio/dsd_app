@@ -83,21 +83,21 @@ def load_diam_vel_mapping_csv(mapping_file_path: Union[str, Path]) -> Tuple[List
         raise
 
 # Label helper
-def _get_label(event_id: Optional[int], start_date: Optional[str], end_date: Optional[str]) -> str:
-    try:
-        if event_id is not None:
-            label = f"Event {event_id}"
-        elif start_date and end_date:
-            label = f"Date Range {start_date} to {end_date}"
-        else:
-            label = "All Data"
-        logger.debug("Generated label: %s", label)
-        return label
-    except Exception:
-        logger.exception("Error forming label for event_id=%s, start_date=%s, end_date=%s", event_id, start_date, end_date)
-        return "Data"
-
-# 1. Precipitation Intensity Plots
+def _get_label(
+    event_id: Optional[int],
+    start_date: Optional[str],
+    end_date: Optional[str]
+) -> str:
+    # Si tenemos event_id Y start/end, muéstralos juntos
+    if event_id is not None and start_date and end_date:
+        return f"Event {event_id} ({start_date} – {end_date})"
+    # Si sólo tenemos event_id
+    if event_id is not None:
+        return f"Event {event_id}"
+    # Si sólo tenemos fechas
+    if start_date and end_date:
+        return f"Date Range {start_date} to {end_date}"
+    return "All Data"
 
 # 1. Precipitation Intensity Plots
 def plot_precipitation_intensity_separate(
@@ -119,16 +119,26 @@ def plot_precipitation_intensity_separate(
         for interval in intervals:
             try:
                 acc = df['Intensidad'].resample(f'{interval}T').sum()
+                times = acc.index.to_pydatetime()
+                values = acc.values
+                x = mdates.date2num(times)
+                width = interval / 1440  # intervalo en minutos convertido a "días"
+
+                # 3) Plot con bar de Matplotlib
                 fig, ax = plt.subplots(figsize=(10, 5))
-                sns.barplot(x=acc.index, y=acc.values, ax=ax)
-                ax.set_title(f'Precipitation Intensity - {label} - {interval}min')
-                ax.set_xlabel('Time'); ax.set_ylabel('Accumulated Intensity (mm)')
-                # Month-day and time format
+                ax.bar(x, values, width=width, align='center')
+
+                # 4) Formatear eje fecha
+                ax.xaxis_date()
                 locator = mdates.AutoDateLocator(minticks=3, maxticks=10)
                 formatter = mdates.DateFormatter('%b %d %H:%M')
                 ax.xaxis.set_major_locator(locator)
                 ax.xaxis.set_major_formatter(formatter)
-                plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
+                fig.autofmt_xdate()
+
+                ax.set_title(f'Precipitation Intensity - {label} - {interval}min')
+                ax.set_xlabel('Time')
+                ax.set_ylabel('Accumulated Intensity (mm)')
                 plt.tight_layout()
                 if save_dir:
                     save_dir.mkdir(parents=True, exist_ok=True)
@@ -155,33 +165,74 @@ def plot_hyetograph(
     logger.debug("Entering plot_hyetograph")
     try:
         label = _get_label(event_id, start_date, end_date)
-        interval = 10
+        interval = 10  # minutes
+
+        # --- Parse & clean ---
         df = df_event.copy()
         df['Datetime'] = pd.to_datetime(df['Datetime'], errors='coerce')
+        df['Intensidad'] = pd.to_numeric(df['Intensidad'], errors='coerce')  # mm/h
+        df = df.dropna(subset=['Datetime', 'Intensidad']).sort_values('Datetime')
         df.set_index('Datetime', inplace=True)
-        df = df.dropna(subset=['Intensidad'])
-        acc = df['Intensidad'].resample(f'{interval}T').sum()
+
+        if df.empty:
+            logger.warning("No valid rows after parsing Datetime/Intensidad.")
+            return None
+
+        # --- Convert instantaneous rate (mm/h) -> per-sample depth (mm) ---
+        # Elapsed time between samples (seconds)
+        dt_s = df.index.to_series().diff().dt.total_seconds()
+
+        # Use median positive dt for the first row and any missing/invalid intervals
+        median_dt = dt_s[dt_s > 0].median()
+        if not pd.notna(median_dt):
+            # Fallback to 60 s if we can't infer (e.g., single-row event)
+            median_dt = 60.0
+        # Clip to avoid zero/negative intervals, then fill NA with median
+        dt_s = dt_s.clip(lower=1).fillna(median_dt)
+
+        # Per-sample depth in mm = (mm/h) * (seconds / 3600)
+        depth_mm = df['Intensidad'] * (dt_s / 3600.0)
+        depth_mm.name = 'Depth_mm'
+
+        # --- Aggregate to fixed bins (e.g., 10 minutes) ---
+        acc = depth_mm.resample(f'{interval}T', label='right', closed='right', origin='start_day').sum()
+
+        # --- Prepare for plotting ---
+        times = acc.index.to_pydatetime()
+        values = acc.values  # mm per interval
+
+        x = mdates.date2num(times)
+        width = interval / 1440.0  # days
+
         fig, ax = plt.subplots(figsize=(10, 5))
-        sns.barplot(x=acc.index, y=acc.values, ax=ax, color='teal')
-        ax.set_title(f'Hyetograph - {label} - {interval}min')
-        ax.set_xlabel('Time'); ax.set_ylabel('Intensity (mm)')
-        # Month-day and time format
+        ax.bar(x, values, width=width, align='center')
+
+        ax.xaxis_date()
         locator = mdates.AutoDateLocator(minticks=3, maxticks=10)
         formatter = mdates.DateFormatter('%b %d %H:%M')
         ax.xaxis.set_major_locator(locator)
         ax.xaxis.set_major_formatter(formatter)
-        plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
+        fig.autofmt_xdate()
+
+        ax.set_title(f'Hyetograph - {label} - {interval} min accum')
+        ax.set_xlabel('Time')
+        ax.set_ylabel('Rain depth (mm)')  # now plotting accumulated depth, not rate
         plt.tight_layout()
+
         if save_dir:
             save_dir.mkdir(parents=True, exist_ok=True)
-            fp = save_dir / f'hyetograph_{label.replace(" ","_")}.png'
-            fig.savefig(fp)
+            safe_label = "".join(c if c.isalnum() or c in "._-" else "_" for c in label)
+            fp = save_dir / f'hyetograph_{safe_label}_{interval}min.png'
+            fig.savefig(fp, dpi=150)
             logger.info("Saved hyetograph to %s", fp)
+
         plt.close(fig)
         return fig
+
     except Exception:
         logger.exception("Error in plot_hyetograph")
         return None
+
 
 # 3. Total Accumulated Precipitation
 def plot_accumulated_precipitation(

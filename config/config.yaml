@@ -18,7 +18,7 @@ event:
   annotated_csv_output: data/processed/annotated_data.csv
   combined_matrix_directory: data/matrices/combined
   csv_input: data/processed/output_data.csv
-  end_date: '2025-01-15'
+  end_date: '2025-02-28'
   event_directory: data/processed/events
   intensidad_threshold: 0.0
   log_file: logs/event.log
@@ -29,7 +29,7 @@ event:
   particulas_threshold: 0
   start_date: '2025-01-02'
 get_dsdfile:
-  end_date: '2025-01-15'
+  end_date: '2025-02-28'
   log_file_path: logs/get_dsdfile.log
   max_workers: 4
   output_directory: data/processed
@@ -39,7 +39,7 @@ visualization:
   annotated_csv: data/processed
   combined_matrices_dir: data/matrices/combined
   diam_vel_mapping_file: diam_vel_mapping.csv
-  end_date: '2025-01-15'
+  end_date: '2025-02-28'
   log_file_path: logs/visualization.log
   plots_output_dir: plots
   start_date: '2025-01-02'

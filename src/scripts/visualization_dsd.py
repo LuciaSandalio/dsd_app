@@ -57,12 +57,19 @@ def process_event(
         if df_event.empty:
             logging.warning(f"All 'Intensidad' values are NaN for Event {event_id_int}. Skipping plots.")
             return (event_id_int, False)
+        
+        # Aseguramos que exista la columna Datetime
+        df_event['Datetime'] = pd.to_datetime(df_event['Datetime'])
+        start_dt = df_event['Datetime'].min().strftime('%Y-%m-%d %H:%M')
+        end_dt   = df_event['Datetime'].max().strftime('%Y-%m-%d %H:%M')
 
         # Plot precipitation intensity
         plot_precipitation_intensity_separate(
             df_event=df_event,
             intervals=accumulation_intervals,
             event_id=event_id_int,
+            start_date=start_dt,
+            end_date=end_dt,
             save_dir=dirs['intensity_dir']
         )
 
@@ -70,6 +77,8 @@ def process_event(
         plot_hyetograph(
             df_event=df_event,
             event_id=event_id_int,
+            start_date=start_dt,
+            end_date=end_dt,
             save_dir=dirs['hyetograph_dir']
         )
 
@@ -77,6 +86,8 @@ def process_event(
         plot_accumulated_precipitation(
             df_event=df_event,
             event_id=event_id_int,
+            start_date=start_dt,
+            end_date=end_dt,
             save_dir=dirs['intensity_dir']
         )
 
@@ -100,6 +111,8 @@ def process_event(
             combined_matrix=combined_matrix,
             diameters=diameters,
             event_id=event_id_int,
+            start_date=start_dt,
+            end_date=end_dt,
             save_dir=dirs['size_dir']
         )
 
@@ -108,6 +121,8 @@ def process_event(
             combined_matrix=combined_matrix,
             velocities=velocities,
             event_id=event_id_int,
+            start_date=start_dt,
+            end_date=end_dt,
             save_dir=dirs['velocity_dir']
         )
 
@@ -117,6 +132,8 @@ def process_event(
             velocities=velocities,
             diameters=diameters,
             event_id=event_id_int,
+            start_date=start_dt,
+            end_date=end_dt,
             save_dir=dirs['heatmap_dir']
         )
 

@@ -1,19 +1,64 @@
-# Byte-compiled / cache
+# ── Python caches ──────────────────────────────────────────────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
 
-# Logs
+# ── Entornos / variables ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# ── Build / distribución ──────────────────────────────────────────────────────
+build/
+dist/
+*.egg-info/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
 logs/
+!logs/.gitkeep
 *.log
 
-# Generated data
+# ── Datos generados ───────────────────────────────────────────────────────────
 data/**/*.npy
 data/**/*.csv
+# Mantener placeholders, docs y samples
+!data/**/.gitkeep
+!data/**/README.md
+!data/**/samples/**
 
-# Plots
+# ── Plots ─────────────────────────────────────────────────────────────────────
 plots/
+!plots/.gitkeep
 
-# OS metadata
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Testing / análisis estático ───────────────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.coverage
+
+# ── IDE / Editor ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+
+# ── Metadatos de SO ───────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+desktop.ini
 
+# ── Locks de editores (LibreOffice, etc.) ─────────────────────────────────────
+~lock.*#
+
+# ── Binarios/artefactos opcionales ────────────────────────────────────────────
+*.pkl
+*.so
+
+# ── Config local (no subir secretos) ──────────────────────────────────────────
+config/*.local.yaml
