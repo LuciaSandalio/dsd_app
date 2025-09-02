@@ -18,6 +18,7 @@ dependencies:
   # Utilities
   - pyyaml>=6.0,<7.0
   - tqdm>=4.64,<5.0
+  - tzdata>=2023.3
 
   # pip just in case
   - pip
