@@ -3,13 +3,14 @@
 
 ## Instrucciones para Windows
 
-1. **Clonar y crear entorno (Conda recomendado)**
-   
+1. **Clonar y crear entorno **
+   **Con conda (Recomendado)**
+   ```python
    git clone https://github.com/LuciaSandalio/dsd_app.git
    cd dsd_app
    conda env create -f environment.yml
    conda activate dsd_app
-
+   ```
    **Con pip y venv**:
    ```python
     py -3.9 -m venv .venv
@@ -22,14 +23,14 @@
    ```
 
 
-2. **Congiguracion local**
+3. **Congiguracion local**
 
     ```python
     Copy-Item config\config.example.yaml config\config.yaml
     ```
     **Editar fechas y rutas en config\config.yaml**
 
-3. **Ejecutar**
+4. **Ejecutar**
 
     ```python
     python src\scripts\get_dsdfile.py
