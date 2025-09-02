@@ -3,8 +3,10 @@
 
 ## Instrucciones para Windows
 
-1. **Clonar y crear entorno **
-   **Con conda (Recomendado)**
+1. **Clonar y crear entorno**
+   
+   
+   **Con conda (Recomendado)**:
    ```python
    git clone https://github.com/LuciaSandalio/dsd_app.git
    cd dsd_app
