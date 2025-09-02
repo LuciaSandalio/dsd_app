@@ -1,637 +1,845 @@
-# modules/event_identification.py
+#!/usr/bin/env python3
+# src/modules/event_identification.py
+# Event labeling utilities, diagnostics, and side-effect helpers.
 
-import pandas as pd
-import numpy as np
+from __future__ import annotations
+
+import json
 import logging
-import shutil
-import os
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List, Tuple, Union, Optional, Dict
-from typing import Optional, Union
-from concurrent.futures import ProcessPoolExecutor, as_completed  
-from tqdm import tqdm  # For progress visualization
-from datetime import datetime
+from typing import List, Optional, Tuple, Dict, Any
+from tempfile import NamedTemporaryFile
+
+import numpy as np
+import pandas as pd
+
 from modules.utils import ensure_directory_exists
 
+# ---------------------------------------------------------------------------
+# I/O helpers (atomic CSV)
+# ---------------------------------------------------------------------------
 
-def save_annotated_data(df: pd.DataFrame, annotated_csv_path: Union[str, Path]) -> None:
+def _safe_write_csv(df: pd.DataFrame, dest: Path, safe: bool = True) -> None:
+    dest = Path(dest)
+    ensure_directory_exists(dest.parent)
+    if safe:
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
+        df.to_csv(tmp, index=False)
+        tmp.replace(dest)
+    else:
+        df.to_csv(dest, index=False)
+
+# ---------------------------------------------------------------------------
+# Core helpers (rate → depth, dedup, timestamp handling)
+# ---------------------------------------------------------------------------
+
+def integrate_rate_to_depth_mm(
+    df: pd.DataFrame,
+    *,
+    time_col: str = "Datetime",
+    rate_col: str = "Intensidad",
+    cap_gap_minutes: Optional[int] = 30,
+    fill_first: str = "median",  # "median" or "zero"
+) -> pd.Series:
     """
-    Save the annotated DataFrame with precipitation event identifiers to a CSV file.
-    Backs up the existing file by appending a timestamped '.bak' extension.
+    Convert rainfall rate (mm/h) into per-sample depth (mm) using Δt between rows.
 
-    Parameters:
-    - df (pd.DataFrame): Annotated DataFrame. Must contain 'Precip_Event' column.
-    - annotated_csv_path (str or Path): Path to save the annotated CSV.
+    - df[time_col]: timestamp column (string or datetime-like)
+    - df[rate_col]: instantaneous rain rate in mm/h
+    - cap_gap_minutes: cap Δt to avoid over-integration across outages (None to disable)
+    - fill_first: how to fill Δt of the first row ("median" positive Δt of series, or "zero")
 
-    Raises:
-    - ValueError: If required columns are missing from the DataFrame.
-    - Exception: If saving the DataFrame fails.
+    Returns a Series aligned to df.index named "Depth_mm".
     """
-    annotated_path = Path(annotated_csv_path).resolve()
-    required_columns = {'Precip_Event'}
-    if not required_columns.issubset(df.columns):
-        missing = required_columns - set(df.columns)
-        logging.error(f"DataFrame is missing required columns for saving: {missing}")
-        raise ValueError(f"Missing required columns: {missing}")
+    if time_col not in df.columns or rate_col not in df.columns:
+        return pd.Series([0.0] * len(df), index=df.index, dtype=float, name="Depth_mm")
 
-    logging.info(f"Columns before saving: {df.columns.tolist()}")
-    logging.debug("Preview of annotated data:")
-    logging.debug(df.head())
+    t = pd.to_datetime(df[time_col], errors="coerce")
+    r = pd.to_numeric(df[rate_col], errors="coerce").fillna(0.0)
 
-    try:
-        # Backup existing file if it exists with a timestamp
-        if annotated_path.exists():
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_path = annotated_path.with_suffix(f"{annotated_path.suffix}.bak.{timestamp}")
-            shutil.copy(str(annotated_path), str(backup_path))
-            logging.info(f"Backup of existing file created at {backup_path}")
+    mask = t.notna() & r.notna()
+    if not mask.any():
+        return pd.Series([0.0] * len(df), index=df.index, dtype=float, name="Depth_mm")
 
-        # Save the annotated DataFrame
-        df.to_csv(annotated_path, index=False)
-        logging.info(f"Annotated data saved to {annotated_path}")
-    except Exception as e:
-        logging.error(f"Failed to save annotated data to {annotated_csv_path}: {e}", exc_info=True)
-        raise
+    t_valid = t[mask]
+    dt_s = t_valid.diff().dt.total_seconds()
 
+    if fill_first == "median":
+        med = dt_s[dt_s > 0].median()
+        if not pd.notna(med):
+            med = 60.0
+        dt_s = dt_s.fillna(med)
+    else:
+        dt_s = dt_s.fillna(0.0)
 
-def save_event(event_number: int, group: pd.DataFrame, event_dir: Union[str, Path]) -> None:
-    """
-    Save a single precipitation event to a CSV file.
+    if cap_gap_minutes is not None and cap_gap_minutes > 0:
+        cap_s = float(cap_gap_minutes) * 60.0
+        dt_s = dt_s.clip(upper=cap_s)
 
-    Parameters:
-    - event_number (int): Unique identifier for the precipitation event.
-    - group (pd.DataFrame): DataFrame containing the event data. Must include all relevant columns.
-    - event_dir (str or Path): Directory to save the event CSV.
+    depth_mm_valid = r[mask].values * (dt_s.values / 3600.0)
 
-    Raises:
-    - Exception: If saving the event fails.
-    """
-    event_directory = Path(event_dir).resolve()
-    event_csv_path = event_directory / f"event_{event_number}.csv"
-    
-    if group.empty:
-        logging.warning(f"Attempted to save event {event_number}, but the data group is empty.")
-        return
-    
-    try:
-        group.to_csv(event_csv_path, index=False)
-        logging.info(f"Event {event_number} saved to {event_csv_path}")
-    except Exception as e:
-        logging.error(f"Failed to save event {event_number} to {event_csv_path}: {e}", exc_info=True)
-        raise
-
-
-def extract_and_save_events(df: pd.DataFrame, 
-                            event_dir: Union[str, Path], 
-                            max_workers: Optional[int] = None) -> None:
-    """
-    Extract individual precipitation events from the annotated DataFrame and save each as a separate CSV file in parallel.
-
-    Parameters:
-    - df (pd.DataFrame): Annotated DataFrame with a 'Precip_Event' column indicating event numbers.
-    - event_dir (str or Path): Directory to save individual event CSVs.
-    - max_workers (int, optional): Maximum number of worker processes for parallel saving. Defaults to min(32, os.cpu_count() + 4).
-
-    Raises:
-    - ValueError: If required columns are missing from the DataFrame.
-    - Exception: If saving any event fails.
-    """
-    required_columns = {'Precip_Event'}
-    if not required_columns.issubset(df.columns):
-        missing = required_columns - set(df.columns)
-        logging.error(f"DataFrame is missing required columns for event extraction: {missing}")
-        raise ValueError(f"Missing required columns: {missing}")
-
-    # Drop rows without event identifiers
-    event_df = df.dropna(subset=['Precip_Event']).copy()
-    event_df['Precip_Event'] = event_df['Precip_Event'].astype(int)
-    grouped_events = event_df.groupby('Precip_Event')
-
-    # Ensure the event directory exists
-    ensure_directory_exists(event_dir)
-
-    # Determine number of workers
-    if max_workers is None:
-        max_workers = min(32, (os.cpu_count() or 1) + 4)
-
-    # Parallelize saving individual events using ProcessPoolExecutor
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(save_event, event_number, group, event_dir): event_number
-            for event_number, group in grouped_events
-        }
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Saving events", unit="event"):
-            event_number = futures[future]
-            try:
-                future.result()
-            except Exception as e:
-                logging.error(f"Error saving event {event_number}: {e}", exc_info=True)
-
+    out = pd.Series(0.0, index=df.index, dtype=float, name="Depth_mm")
+    out.loc[mask] = depth_mm_valid
+    return out
 
 def remove_duplicates(df: pd.DataFrame, subset_columns: Optional[List[str]] = None) -> Tuple[pd.DataFrame, int]:
-    """
-    Remove duplicate rows based on specified subset columns, ensuring the uniqueness of 'Datetime'.
-
-    Parameters:
-    - df (pd.DataFrame): Input DataFrame.
-    - subset_columns (list, optional): Columns to consider for identifying duplicates. Defaults to ['Timestamp', 'Datetime'].
-
-    Returns:
-    - pd.DataFrame: DataFrame without duplicate rows based on subset columns.
-    - int: Number of duplicates removed.
-
-    Raises:
-    - ValueError: If specified subset columns are missing from the DataFrame.
-    """
+    """Remove duplicate rows based on subset columns (default: Timestamp/Datetime)."""
     if subset_columns is None:
-        subset_columns = ['Timestamp', 'Datetime']
-    
-    required_columns = set(subset_columns)
-    if not required_columns.issubset(df.columns):
-        missing = required_columns - set(df.columns)
-        logging.error(f"Missing required columns for duplicate removal: {missing}")
-        raise ValueError(f"Missing required columns: {missing}")
-    
-    initial_count = len(df)
-    df = df.drop_duplicates(subset=subset_columns, keep='first').reset_index(drop=True)
-    final_count = len(df)
-    duplicates_removed = initial_count - final_count
-    logging.info(f"Removed {duplicates_removed} duplicate rows based on columns {subset_columns}.")
+        subset_columns = [c for c in ("Timestamp", "Datetime") if c in df.columns] or df.columns.tolist()
+    before = len(df)
+    dedup = df.drop_duplicates(subset=subset_columns, keep="last").copy()
+    return dedup, before - len(dedup)
 
-    # Ensure 'Datetime' is unique
-    if df['Datetime'].duplicated().any():
-        logging.warning("Warning: 'Datetime' column has duplicate entries after removing duplicates.")
-    else:
-        logging.info("'Datetime' column is unique.")
+def ensure_continuous_timestamps(df: pd.DataFrame, freq: Optional[str] = None, method: Optional[str] = None) -> pd.DataFrame:
+    """Reindex to a regular time grid on 'Datetime'. If freq None, infer from median step."""
+    if "Datetime" not in df.columns:
+        return df
+    work = df.copy()
+    work["Datetime"] = pd.to_datetime(work["Datetime"], errors="coerce")
+    work = work.dropna(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
 
-    return df, duplicates_removed
+    if freq is None:
+        deltas = work["Datetime"].diff().dropna().dt.total_seconds() / 60.0
+        if len(deltas) == 0:
+            return work
+        step_min = max(1, int(round(np.median(deltas))))
+        freq = f"{step_min}T"
 
-def ensure_continuous_timestamps(df: pd.DataFrame, default_freq: str = 'T') -> Tuple[pd.DataFrame, pd.DatetimeIndex, str]:
-    """
-    Ensure that the DataFrame has continuous timestamps based on the detected frequency.
-    Marks missing data points and returns relevant information.
+    idx = pd.date_range(work["Datetime"].min(), work["Datetime"].max(), freq=freq, tz=work["Datetime"].dt.tz)
+    work = work.set_index("Datetime").reindex(idx)
+    if method in ("ffill", "bfill"):
+        work = getattr(work, method)()
+    return work.reset_index().rename(columns={"index": "Datetime"})
 
-    Parameters:
-    - df (pd.DataFrame): Input DataFrame. Must contain 'Datetime' and 'Timestamp' columns.
-    - default_freq (str): Default frequency to use if inferring fails. Defaults to 'T' (minute).
-
-    Returns:
-    - pd.DataFrame: Reindexed DataFrame with continuous 'Datetime' timestamps.
-    - pd.DatetimeIndex: Timestamps that were missing.
-    - str: Detected or defaulted frequency of the data.
-
-    Raises:
-    - ValueError: If required columns are missing.
-    """
-    required_columns = {'Datetime', 'Timestamp'}
-    if not required_columns.issubset(df.columns):
-        missing = required_columns - set(df.columns)
-        logging.error(f"Missing required columns for timestamp continuity: {missing}")
-        raise ValueError(f"Missing required columns: {missing}")
-
-    # Detect frequency
-    detected_freq = pd.infer_freq(df['Datetime'])
-    if detected_freq is None:
-        # If frequency cannot be inferred, use default_freq
-        expected_freq = default_freq
-        logging.info(f"Frequency could not be inferred. Defaulting to '{expected_freq}' (minute).")
-    else:
-        expected_freq = detected_freq
-        logging.info(f"Inferred frequency: '{expected_freq}'.")
-
-    # Set 'Datetime' as the index
-    df.set_index('Datetime', inplace=True)
-
-    # Check if 'Datetime' index is unique
-    if not df.index.is_unique:
-        logging.warning("'Datetime' index contains duplicate entries. Duplicates will be dropped before reindexing.")
-        df = df[~df.index.duplicated(keep='first')]
-
-    # Create a complete timestamp range based on the data's start and end
-    full_time_index = pd.date_range(start=df.index.min(), end=df.index.max(), freq=expected_freq)
-
-    # Reindex the DataFrame to include all timestamps, explicitly mark missing data
-    df = df.reindex(full_time_index)
-    df['MissingData'] = df['Timestamp'].isna()
-
-    # Rename the index to 'Datetime' and reset it
-    df.index.name = 'Datetime'
-    df.reset_index(inplace=True)
-
-    # Identify missing timestamps
-    missing_timestamps = df[df['MissingData']]['Datetime']
-    missing_count = len(missing_timestamps)
-    ts_list = missing_timestamps.dt.strftime('%Y-%m-%d %H:%M:%S').tolist()
-    logging.info(f"Number of missing timestamps: {missing_count}")
-
-    if missing_count > 0:
-        #logging.info("Missing timestamps detected:")
-        #logging.debug(missing_timestamps)
-        logging.info(f"Missing timestamps:{missing_timestamps}")
-
-        # write the full list out to a separate file for review
-        try:
-            from pathlib import Path
-            # assume your project root is two levels up from this module
-            log_dir = Path(__file__).resolve().parents[2] / 'logs'
-            log_dir.mkdir(parents=True, exist_ok=True)
-            missing_file = log_dir / 'missing_timestamps.txt'
-            with missing_file.open('w') as f:
-                for ts in ts_list:
-                    f.write(ts + '\n')
-            logging.info(f"Saved full missing timestamps to {missing_file}")
-        except Exception as e:
-            logging.error(f"Failed to write missing timestamps file: {e}")
-    else:
-        logging.info("No missing timestamps detected.")
-
-    return df, missing_timestamps, expected_freq
-
-def mark_precipitation_activity(df: pd.DataFrame,
-                                intensidad_threshold: float = 0.0
-                                ) -> pd.DataFrame:
-    """
-    Mark rows where precipitation is active based on 'Intensidad' and 'Nº de partículas', excluding missing data.
-
-    Parameters:
-    - df (pd.DataFrame): Input DataFrame. Must contain 'Intensidad', 'Nº de partículas', and 'MissingData' columns.
-    - intensidad_threshold (float): Minimum 'Intensidad' to consider precipitation active.
-    - particulas_threshold (int): Minimum 'Nº de partículas' to consider precipitation active.
-
-    Returns:
-    - pd.DataFrame: DataFrame with an added 'Precip_Active' boolean column indicating active precipitation.
-    
-    Raises:
-    - ValueError: If required columns are missing from the DataFrame.
-    """
-    required_columns = {'Intensidad', 'MissingData'}
-    if not required_columns.issubset(df.columns):
-        missing = required_columns - set(df.columns)
-        logging.error(f"Missing required columns for marking precipitation activity: {missing}")
-        raise ValueError(f"Missing required columns: {missing}")
-
-    df['Precip_Active'] = (
-        (df['Intensidad'] > intensidad_threshold) &
-        (~df['MissingData'])  # Ensure the row is not marked as missing data
-    )
-    logging.info(
-        f"Marked precipitation activity with thresholds - Intensidad: >{intensidad_threshold}, excluding missing data."
+def _compute_accum_from_rate(df: pd.DataFrame, *, max_gap_min: Optional[float] = None) -> pd.Series:
+    """Backed by integrate_rate_to_depth_mm for a single source of truth."""
+    cap = None if max_gap_min in (None, "", float("nan")) else int(max_gap_min)
+    return integrate_rate_to_depth_mm(
+        df,
+        time_col="Datetime",
+        rate_col="Intensidad",
+        cap_gap_minutes=cap,
+        fill_first="median",
     )
 
-    # Additional logging for active precipitation points
-    active_count = df['Precip_Active'].sum()
-    logging.info(f"Number of precipitation-active points: {active_count}")
-
-    if active_count == 0:
-        logging.warning("No precipitation-active points detected based on the current thresholds.")
-    elif active_count == len(df):
-        logging.warning("All data points are marked as precipitation-active based on the current thresholds.")
-    else:
-        logging.info(f"Precipitation-active points range from {df['Datetime'].min()} to {df['Datetime'].max()}.")
-
-    return df
-
-
-def combine_matrices_for_event(
-    event_timestamps: Optional[List[int]] = None,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    matrix_directory: Union[str, Path] = 'data/processed/matrices',
-    output_csv_dir: Optional[Union[str, Path]] = None,
-    diameters: Optional[List[float]] = None,
-    velocities: Optional[List[float]] = None
-) -> Optional[Dict[str, np.ndarray]]:
+def _build_is_raining_hysteresis(
+    rate_mm_h: pd.Series,
+    *,
+    start_thr: float,
+    stop_thr: float,
+    min_wet_streak: int = 1,
+    min_dry_streak: int = 1,
+) -> np.ndarray:
     """
-    Load and combine matrices based on event timestamps and/or a date range.
-
-    Parameters:
-    - event_timestamps (Optional[List[int]]): List of UNIX timestamps for specific events.
-    - start_date (Optional[str]): Start date in 'YYYY-MM-DD' format.
-    - end_date (Optional[str]): End date in 'YYYY-MM-DD' format.
-    - matrix_directory (str or Path): Directory where matrix files are stored.
-    - output_csv_dir (Optional[Union[str, Path]]): Full path to save the output CSV file.
-    - diameters (Optional[List[float]]): List of diameters for matrix columns.
-    - velocities (Optional[List[float]]): List of velocities for matrix rows.
-
-    Returns:
-    - Optional[Dict[str, np.ndarray]]:
-        - For event timestamps: {'combined_event_matrix': np.ndarray}
-        - For date range: {'date_range_matrix': np.ndarray}
-        Returns None if no matrices are loaded.
+    Return boolean array using hysteresis + min consecutive wet/dry streaks.
+    start when rate >= start_thr and (wet_streak >= min_wet_streak),
+    stop  when rate <  stop_thr and (dry_streak >= min_dry_streak).
     """
-    try:
-        matrix_dir = Path(matrix_directory).resolve()
-        output_path = Path(output_csv_dir).resolve() if output_csv_dir else None
-        event_matrices = []
-        date_range_matrices = []
-        expected_shape = None
-        loaded_timestamps = set()
-
-        # Validate input identifiers
-        if not event_timestamps and not (start_date and end_date):
-            logging.error("Insufficient identifiers provided. Provide either event_timestamps, a date range, or both.")
-            return None
-
-        # Create output directory if saving CSVs
-        if output_path:
-            try:
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                logging.debug(f"Ensured existence of directory: {output_path.parent}")
-            except Exception as e:
-                logging.error(f"Failed to create directory {output_path.parent}: {e}", exc_info=True)
-                return None
-
-        # Collect matrices based on event_timestamps
-        if event_timestamps:
-            for timestamp in event_timestamps:
-                timestamp_int = int(timestamp)
-                if timestamp_int in loaded_timestamps:
-                    logging.debug(f"Matrix for timestamp {timestamp_int} already loaded. Skipping to avoid double-counting.")
-                    continue
-                matrix_path = matrix_dir / f"matrix_{timestamp_int}.npy"
-                if matrix_path.exists():
-                    try:
-                        matrix = np.load(matrix_path)
-                        if expected_shape is None:
-                            expected_shape = matrix.shape
-                            logging.debug(f"Expected matrix shape set to: {expected_shape}")
-                        elif matrix.shape != expected_shape:
-                            logging.error(f"Inconsistent matrix shapes: {matrix.shape} vs {expected_shape}")
-                            raise ValueError(f"Inconsistent matrix shapes: {matrix.shape} vs {expected_shape}")
-                        event_matrices.append(matrix)
-                        loaded_timestamps.add(timestamp_int)
-                        logging.debug(f"Loaded matrix from {matrix_path}")
-                    except Exception as e:
-                        logging.error(f"Error loading matrix {matrix_path}: {e}", exc_info=True)
-                        continue
-                else:
-                    logging.warning(f"Matrix file for timestamp {timestamp_int} not found at {matrix_path}.")
-
-            if event_matrices:
-                combined_event_matrix = np.sum(event_matrices, axis=0)
-                logging.debug(f"Combined event matrix shape: {combined_event_matrix.shape}")
-
-                # Save combined event matrix as CSV if required
-                if output_path:
-                    try:
-                        df_combined = pd.DataFrame(combined_event_matrix)
-                        # Add headers if diameters and velocities are provided
-                        if diameters is not None:
-                            if len(diameters) != combined_event_matrix.shape[1]:
-                                logging.error("Number of diameters does not match matrix columns.")
-                                raise ValueError("Number of diameters does not match matrix columns.")
-                            df_combined.columns = [f"{d}mm" for d in diameters]
-                            logging.debug("Added diameter headers to combined event matrix.")
-                        if velocities is not None:
-                            if len(velocities) != combined_event_matrix.shape[0]:
-                                logging.error("Number of velocities does not match matrix rows.")
-                                raise ValueError("Number of velocities does not match matrix rows.")
-                            df_combined.index = [f"{v}m/s" for v in velocities]
-                            logging.debug("Added velocity indices to combined event matrix.")
-                        df_combined.to_csv(output_path, index=(velocities is not None), header=(diameters is not None))
-                        logging.info(f"Combined event matrix saved as CSV at {output_path}")
-                    except Exception as e:
-                        logging.error(f"Failed to save combined event matrix as CSV at {output_path}: {e}", exc_info=True)
-
-                # Prepare output dictionary
-                output = {'combined_event_matrix': combined_event_matrix}
+    r = pd.to_numeric(rate_mm_h, errors="coerce").fillna(0.0).to_numpy()
+    n = r.shape[0]
+    out = np.zeros(n, dtype=bool)
+    state = False
+    wet_streak = 0
+    dry_streak = 0
+    for i in range(n):
+        if state:
+            if r[i] < stop_thr:
+                dry_streak += 1
+                wet_streak = 0
+                if dry_streak >= min_dry_streak:
+                    state = False
+                    dry_streak = 0
             else:
-                logging.info("No matrices found for the specified event timestamps.")
-                output = {}
+                dry_streak = 0
+                wet_streak += 1
         else:
-            output = {}
+            if r[i] >= start_thr:
+                wet_streak += 1
+                dry_streak = 0
+                if wet_streak >= min_wet_streak:
+                    state = True
+                    wet_streak = 0
+            else:
+                wet_streak = 0
+                dry_streak += 1
+        out[i] = state
+    return out
 
-        # Collect matrices based on date range
-        if start_date and end_date:
-            try:
-                # Convert start_date and end_date to datetime objects
-                start_dt = datetime.strptime(start_date, '%Y-%m-%d')
-                end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+# ---------------------------------------------------------------------------
+# Event model
+# ---------------------------------------------------------------------------
 
-                # Ensure start_date <= end_date
-                if start_dt > end_dt:
-                    logging.error("start_date must be earlier than or equal to end_date.")
-                    return None
+@dataclass
+class Event:
+    id: int
+    site: str
+    start: pd.Timestamp
+    end: pd.Timestamp
+    duration_min: float
+    accum_mm: float
+    max_intensity_mm_h: float
+    mean_intensity_mm_h: float
+    median_intensity_mm_h: float
+    p95_intensity_mm_h: float
+    max_gap_inside_min: float
+    n_points: int
 
-            except ValueError as ve:
-                logging.error(f"Invalid date format: {ve}")
-                return None
+# ---------------------------------------------------------------------------
+# Core identification
+# ---------------------------------------------------------------------------
 
-            # Convert dates to UNIX timestamps (integer)
-            start_timestamp = int(start_dt.timestamp())
-            end_timestamp = int(end_dt.timestamp())
+def mark_precipitation_activity(df: pd.DataFrame, intensity_threshold_mm_h: float) -> pd.DataFrame:
+    """Simple threshold mark (kept for API stability)."""
+    work = df.copy()
+    work["Intensidad"] = pd.to_numeric(work.get("Intensidad", pd.Series(index=work.index)), errors="coerce")
+    work["is_raining"] = (work["Intensidad"].fillna(0) >= float(intensity_threshold_mm_h))
+    return work
 
-            # Collect all relevant matrix files within the date range
-            try:
-                all_files = matrix_dir.glob('matrix_*.npy')
-                for file in all_files:
-                    try:
-                        # Extract timestamp from filename
-                        parts = file.stem.split('_')
-                        if len(parts) < 2:
-                            raise ValueError("Filename does not contain timestamp.")
-                        timestamp_str = parts[1]
-                        timestamp = int(timestamp_str)
-                        if start_timestamp <= timestamp <= end_timestamp:
-                            if timestamp in loaded_timestamps:
-                                logging.debug(f"Matrix for timestamp {timestamp} already loaded. Skipping to avoid double-counting.")
-                                continue
-                            matrix = np.load(file)
-                            if expected_shape is None:
-                                expected_shape = matrix.shape
-                                logging.debug(f"Expected matrix shape set to: {expected_shape}")
-                            elif matrix.shape != expected_shape:
-                                logging.error(f"Inconsistent matrix shapes: {matrix.shape} vs {expected_shape}")
-                                raise ValueError(f"Inconsistent matrix shapes: {matrix.shape} vs {expected_shape}")
-                            date_range_matrices.append(matrix)
-                            loaded_timestamps.add(timestamp)
-                            logging.debug(f"Loaded matrix from {file}")
-
-                    except (IndexError, ValueError) as parse_error:
-                        logging.warning(f"Filename {file.name} does not match expected pattern: {parse_error}")
-                        continue
-
-                if date_range_matrices:
-                    date_range_matrix = np.sum(date_range_matrices, axis=0)
-                    logging.debug(f"Combined date range matrix shape: {date_range_matrix.shape}")
-
-                    # Save date range matrix as CSV if required
-                    if output_path:
-                        try:
-                            df_date_range = pd.DataFrame(date_range_matrix)
-                            # Add headers if diameters and velocities are provided
-                            if diameters is not None:
-                                if len(diameters) != date_range_matrix.shape[1]:
-                                    logging.error(f"Number of diameters ({len(diameters)}) does not match matrix columns ({date_range_matrix.shape[1]}).")
-                                    raise ValueError(f"Number of diameters ({len(diameters)}) does not match matrix columns ({date_range_matrix.shape[1]}).")
-                                df_date_range.columns = [f"{d}mm" for d in diameters]
-                                logging.debug("Added diameter headers to date range matrix.")
-                            if velocities is not None:
-                                if len(velocities) != date_range_matrix.shape[0]:
-                                    logging.error(f"Number of velocities ({len(velocities)}) does not match matrix rows ({date_range_matrix.shape[0]}).")
-                                    raise ValueError(f"Number of velocities ({len(velocities)}) does not match matrix rows ({date_range_matrix.shape[0]}).")
-                                df_date_range.index = [f"{v}m/s" for v in velocities]
-                                logging.debug("Added velocity indices to date range matrix.")
-
-                            # Directly use output_path as the target CSV file
-                            df_date_range.to_csv(output_path, index=(velocities is not None), header=(diameters is not None))
-                            logging.info(f"Date range matrix saved as CSV at {output_path}")
-                        except Exception as e:
-                            logging.error(f"Failed to save date range matrix as CSV at {output_path}: {e}", exc_info=True)
-
-                    # Update output dictionary
-                    output['date_range_matrix'] = date_range_matrix
-                else:
-                    logging.info("No matrices found within the specified date range.")
-            except Exception as e:
-                logging.error(f"Error accessing matrix files in {matrix_dir}: {e}", exc_info=True)
-
-        # Final output check
-        if not output:
-            logging.info("No matrices were loaded based on the provided inputs.")
-            return None
-
-        return output
-
-    except Exception as e:
-        logging.error(f"Error combining matrices for event/date range: {e}", exc_info=True)
-        return None
-
-
-    
-def identify_precipitation_events(df: pd.DataFrame,
-                                  min_gap_hours: int = 2,
-                                  matrix_directory: Union[str, Path] = "matrices",
-                                  combined_matrix_directory: Union[str, Path] = "combined_matrices") -> Tuple[pd.DataFrame, int]:
+def identify_precipitation_events(
+    df: pd.DataFrame,
+    *,
+    intensity_threshold_mm_h: float,
+    min_duration_min: int,
+    min_gap_min: int,
+    min_accum_mm: float,
+    merge_if_gap_min: Optional[int] = None,
+    # hysteresis knobs
+    start_threshold_mm_h: Optional[float] = None,
+    stop_threshold_mm_h: Optional[float] = None,
+    min_wet_streak: int = 1,
+    min_dry_streak: int = 1,
+    max_gap_for_rate_integration_min: Optional[float] = None,
+    require_both_filters: bool = True,
+    site: str = "",
+) -> Tuple[pd.DataFrame, List[Event]]:
     """
-    Identify and assign precipitation events based on a minimum gap between active precipitation points.
-    Combines corresponding matrices for each identified event.
-
-    Parameters:
-    - df (pd.DataFrame): Input DataFrame with a 'Precip_Active' boolean column.
-    - min_gap_hours (int): Minimum gap in hours to consider the start of a new event.
-    - matrix_directory (str or Path): Directory containing individual matrix files named as 'matrix_{timestamp}.npy'.
-    - combined_matrix_directory (str or Path): Directory to save combined event matrices.
-
-    Returns:
-    - pd.DataFrame: DataFrame with an added 'Precip_Event' column indicating event numbers.
-    - int: Total number of precipitation events identified.
-
-    Raises:
-    - ValueError: If required columns are missing or matrix files have inconsistent formats.
+    Segment events with hysteresis (if provided), gap rules, and filters.
+    Returns annotated DF + list of Event dataclasses (deterministic IDs by start time).
     """
-    required_columns = {'Precip_Active', 'Datetime'}
-    if not required_columns.issubset(df.columns):
-        missing = required_columns - set(df.columns)
-        logging.error(f"Missing required columns for event identification: {missing}")
-        raise ValueError(f"Missing required columns: {missing}")
+    if "Datetime" not in df.columns:
+        raise ValueError("DataFrame must have 'Datetime' column.")
+    if "Intensidad" not in df.columns:
+        raise ValueError("DataFrame must have 'Intensidad' (mm/h) column.")
 
-    MIN_GAP = pd.Timedelta(hours=min_gap_hours)
+    work = df.copy()
+    work["Datetime"] = pd.to_datetime(work["Datetime"], errors="coerce")
+    work["Intensidad"] = pd.to_numeric(work["Intensidad"], errors="coerce")
+    work = work.dropna(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
 
-    # Extract precipitation-active timestamps
-    precip_timestamps = df.loc[df['Precip_Active'], 'Datetime'].reset_index(drop=True)
+    # Accumulation per row from instantaneous rate
+    work["accum_from_rate_mm"] = _compute_accum_from_rate(work, max_gap_min=max_gap_for_rate_integration_min)
 
-    if precip_timestamps.empty:
-        logging.info("No precipitation events detected based on the current criteria.")
-        df['Precip_Event'] = np.nan
-        return df, 0
-
-    # Calculate time differences between consecutive precipitation-active points
-    time_gaps = precip_timestamps.diff()
-
-    # Identify new events where the gap is greater than or equal to the specified minimum gap
-    new_event_flags = time_gaps >= MIN_GAP
-
-    # Assign event numbers using the cumulative sum of new event flags
-    event_numbers = new_event_flags.cumsum().fillna(0).astype(int) + 1
-
-    # Initialize 'Precip_Event' column
-    df['Precip_Event'] = np.nan
-
-    # Assign event numbers to precipitation-active rows
-    df.loc[df['Precip_Active'], 'Precip_Event'] = event_numbers.values
-
-    # Forward fill to propagate event numbers, but only within active precipitation
-    df['Precip_Event'] = df['Precip_Event'].ffill().where(df['Precip_Active'])
-
-    # Correct event count
-    event_count = df['Precip_Event'].nunique() - (1 if df['Precip_Event'].isna().any() else 0)
-    logging.info(f"Total precipitation events identified: {event_count}")
-
-    # Debug: Print some event assignments
-    logging.info("Sample precipitation event assignments:")
-    logging.debug(df[['Datetime', 'Intensidad', 'Nº de partículas', 'Precip_Event']].dropna().head())
-
-    unique_events = df['Precip_Event'].dropna().unique()
-    combined_matrix_dir = Path(combined_matrix_directory).resolve()
-    ensure_directory_exists(combined_matrix_dir)
-
-    for event_id in unique_events:
-        # Convert pd.Timestamp to Unix timestamp or appropriate format based on matrix naming convention
-        event_timestamps = df[df['Precip_Event'] == event_id]['Timestamp'].astype(int) 
-
-        # Logging the list of timestamps for the event
-        logging.info(f"Processing Event ID: {event_id}")
-        logging.info(f"Timestamps for Event {event_id}: {event_timestamps}")
-        
-        # Optionally, print to console
-        print(f"Processing Event ID: {event_id}")
-        print(f"Timestamps for Event {event_id}: {event_timestamps}")
-
-        event_dir = Path(combined_matrix_directory)
-        # 1) define two sub‑folders
-        csv_dir = event_dir / "combined_csv"
-        npy_dir = event_dir / "combined_npy"
-
-        # 2) make sure they exist
-        csv_dir.mkdir(parents=True, exist_ok=True)
-        npy_dir.mkdir(parents=True, exist_ok=True)
-
-        # 3) build the output paths
-        csv_out = csv_dir / f"combined_event_{event_id}.csv"
-        npy_out = npy_dir / f"combined_event_{event_id}.npy"
-
-        result = combine_matrices_for_event(
-         event_timestamps=event_timestamps.tolist(),
-        matrix_directory=matrix_directory,
-        output_csv_dir=str(csv_out)
+    # Wet/dry via hysteresis (preferred) or simple threshold
+    if start_threshold_mm_h is not None and stop_threshold_mm_h is not None:
+        wet = _build_is_raining_hysteresis(
+            work["Intensidad"],
+            start_thr=float(start_threshold_mm_h),
+            stop_thr=float(stop_threshold_mm_h),
+            min_wet_streak=int(min_wet_streak),
+            min_dry_streak=int(min_dry_streak),
         )
-        if result and 'combined_event_matrix' in result:
-            np.save(npy_out, result['combined_event_matrix'])
-            logging.info(f"Combined matrix saved to {npy_out}")
+    else:
+        wet = (work["Intensidad"].fillna(0) >= float(intensity_threshold_mm_h)).to_numpy()
+
+    work["is_raining"] = wet
+    times = work["Datetime"].to_numpy()
+
+    # Preliminary segmentation, considering min_gap_min
+    event_id = np.full(len(work), -1, dtype=int)
+    current_id = -1
+    for i in range(len(work)):
+        if wet[i]:
+            start_new = (i == 0) or (not wet[i - 1])
+            if not start_new:
+                delta = times[i] - times[i - 1]
+                try:
+                    gap_min = float(delta / np.timedelta64(1, "m"))
+                except Exception:
+                    gap_min = (delta.total_seconds() / 60.0)
+                if gap_min >= float(min_gap_min):
+                    start_new = True
+            if start_new:
+                current_id += 1
+            event_id[i] = current_id
+    work["event_id"] = event_id
+
+    # Optionally merge short dry-gapped neighbors
+    if merge_if_gap_min and merge_if_gap_min > 0:
+        spans = []
+        for eid, grp in work[work["event_id"] >= 0].groupby("event_id"):
+            spans.append((eid, grp["Datetime"].min(), grp["Datetime"].max()))
+        spans.sort(key=lambda t: t[1])
+        merges: Dict[int, int] = {}
+        for (eid1, s1, e1), (eid2, s2, e2) in zip(spans, spans[1:]):
+            gap_min = (s2 - e1).total_seconds() / 60.0
+            if gap_min <= int(merge_if_gap_min):
+                merges[eid2] = eid1
+        if merges:
+            def root(x):
+                while x in merges:
+                    x = merges[x]
+                return x
+            remapped = np.array([root(e) if e >= 0 else e for e in work["event_id"]], dtype=int)
+            valid = sorted({e for e in remapped if e >= 0})
+            id_map = {old: new for new, old in enumerate(valid)}
+            work["event_id"] = np.array([id_map.get(e, -1) for e in remapped], dtype=int)
+
+    # Compute diagnostics, apply filters, finalize IDs
+    events: List[Event] = []
+    out_ids = [e for e in sorted(work["event_id"].unique()) if e >= 0]
+    final_id_map: Dict[int, int] = {}
+    next_id = 0
+
+    for eid in out_ids:
+        block = work[work["event_id"] == eid]
+        if block.empty:
+            continue
+        start = block["Datetime"].iloc[0]
+        end = block["Datetime"].iloc[-1]
+        duration_min = (end - start).total_seconds() / 60.0
+        accum_mm = float(block["accum_from_rate_mm"].sum())
+        intens = block["Intensidad"].astype(float)
+        max_int = float(np.nanmax(intens)) if len(intens) else float("nan")
+        mean_int = float(np.nanmean(intens)) if len(intens) else float("nan")
+        median_int = float(np.nanmedian(intens)) if len(intens) else float("nan")
+        p95_int = float(np.nanpercentile(intens, 95)) if len(intens) else float("nan")
+        gaps_inside = block["Datetime"].diff().dt.total_seconds().div(60.0).fillna(0.0)
+        max_gap_inside = float(np.nanmax(gaps_inside)) if len(gaps_inside) else 0.0
+
+        pass_duration = duration_min >= float(min_duration_min)
+        pass_accum = accum_mm >= float(min_accum_mm)
+        keep = (pass_duration and pass_accum) if require_both_filters else (pass_duration or pass_accum)
+        if not keep:
+            continue
+
+        final_id_map[eid] = next_id
+        events.append(Event(
+            id=next_id,
+            site=site,
+            start=start,
+            end=end,
+            duration_min=duration_min,
+            accum_mm=accum_mm,
+            max_intensity_mm_h=max_int,
+            mean_intensity_mm_h=mean_int,
+            median_intensity_mm_h=median_int,
+            p95_intensity_mm_h=p95_int,
+            max_gap_inside_min=max_gap_inside,
+            n_points=len(block),
+        ))
+        next_id += 1
+
+    work["event_id"] = work["event_id"].map(lambda x: final_id_map.get(x, -1)) if final_id_map else -1
+    return work, events
+
+# ---------------------------------------------------------------------------
+# Saving annotated data and per-event extracts
+# ---------------------------------------------------------------------------
+
+def save_annotated_data(df_annotated: pd.DataFrame, output_dir: Path, safe_write: bool = True) -> Path:
+    out = Path(output_dir) / "annotated_data.csv"
+    _safe_write_csv(df_annotated, out, safe=safe_write)
+    logging.info(f"Annotated data saved: {out}")
+    return out
+
+def extract_and_save_events(
+    df_annotated: pd.DataFrame,
+    events: List[Event],
+    output_dir: Path,
+    filename_pattern: str = "event_{id}.csv",
+    safe_write: bool = True
+) -> List[Path]:
+    ensure_directory_exists(output_dir)
+    written: List[Path] = []
+    for ev in events:
+        ev_df = df_annotated[df_annotated["event_id"] == ev.id].copy()
+        out = Path(output_dir) / filename_pattern.format(id=ev.id)
+        _safe_write_csv(ev_df, out, safe=safe_write)
+        written.append(out)
+        logging.info(f"Event {ev.id} saved: {out}")
+    return written
+
+# ---------------------------------------------------------------------------
+# Combined matrices per event / period
+# ---------------------------------------------------------------------------
+
+def _iter_matrix_files_in_range(matrices_dir: Path, t_start: int, t_end: int) -> List[Path]:
+    """Return matrix_*.npy files whose <timestamp> is in [t_start, t_end]."""
+    found: List[Tuple[int, Path]] = []
+    for p in Path(matrices_dir).glob("matrix_*.npy"):
+        try:
+            ts = int(p.stem.split("_", 1)[1])
+        except Exception:
+            continue
+        if t_start <= ts <= t_end:
+            found.append((ts, p))
+    return [p for _, p in sorted(found, key=lambda x: x[0])]
+
+def _combine_matrices(files: List[Path], matrix_size: int, mode: str = "sum", scale: float = 1.0) -> np.ndarray:
+    """
+    Combine matrices with a mode:
+      - "sum": plain sum
+      - "mean_per_sample": sum / N
+      - "normalize_to_total_mm": sum / scale   (scale = event accumulation in mm)
+    """
+    if not files:
+        return np.zeros((matrix_size, matrix_size), dtype=np.float32)
+    acc = None
+    n = 0
+    for f in files:
+        try:
+            arr = np.load(f, mmap_mode="r")
+            if arr.shape != (matrix_size, matrix_size):
+                logging.warning(f"Matrix shape mismatch in {f}: {arr.shape}")
+                continue
+            arr = np.asarray(arr, dtype=np.float32)
+            acc = arr if acc is None else (acc + arr)
+            n += 1
+        except Exception as e:
+            logging.warning(f"Failed to load matrix {f}: {e}")
+    if acc is None:
+        acc = np.zeros((matrix_size, matrix_size), dtype=np.float32)
+
+    mode = (mode or "sum").lower()
+    if mode == "mean_per_sample" and n > 0:
+        acc = acc / float(n)
+    elif mode == "normalize_to_total_mm" and scale and np.isfinite(scale) and scale > 0:
+        acc = acc / float(scale)
+    return acc
+
+def save_combined_event_matrix(
+    matrices_dir: Path,
+    event: Event,
+    out_path: Path,
+    matrix_size: int = 32,
+    safe_write: bool = True,
+    mode: str = "sum",
+) -> Optional[Path]:
+    t_start = int(event.start.timestamp())
+    t_end = int(event.end.timestamp())
+    files = _iter_matrix_files_in_range(matrices_dir, t_start, t_end)
+    combined = _combine_matrices(files, matrix_size=matrix_size, mode=mode, scale=event.accum_mm)
+
+    ensure_directory_exists(out_path.parent)
+    if safe_write:
+        with NamedTemporaryFile(dir=out_path.parent, delete=False, suffix=out_path.suffix) as tf:
+            np.save(tf, combined)  # ends with .npy
+            tmp = Path(tf.name)
+        tmp.replace(out_path)
+    else:
+        np.save(out_path, combined)
+
+    logging.info(f"Combined matrix saved for event {event.id}: {out_path} (files={len(files)})")
+    return out_path
+
+def save_combined_period_matrix(
+    matrices_dir: Path,
+    start_ts: int,
+    end_ts: int,
+    out_path: Path,
+    matrix_size: int = 32,
+    safe_write: bool = True,
+    mode: str = "sum",
+) -> Optional[Path]:
+    files = _iter_matrix_files_in_range(matrices_dir, start_ts, end_ts)
+    combined = _combine_matrices(files, matrix_size=matrix_size, mode=mode, scale=1.0)
+
+    ensure_directory_exists(out_path.parent)
+    if safe_write:
+        with NamedTemporaryFile(dir=out_path.parent, delete=False, suffix=out_path.suffix) as tf:
+            np.save(tf, combined)
+            tmp = Path(tf.name)
+        tmp.replace(out_path)
+    else:
+        np.save(out_path, combined)
+
+    logging.info(f"Combined period matrix saved: {out_path} (files={len(files)})")
+    return out_path
+
+# ---------------------------------------------------------------------------
+# Summaries
+# ---------------------------------------------------------------------------
+
+def _write_event_summary_csv(events: List[Event], out_path: Path, safe_write: bool = True) -> Path:
+    rows = [asdict(ev) for ev in events]
+    df = pd.DataFrame(rows)
+    ensure_directory_exists(out_path.parent)
+    if safe_write:
+        tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+        df.to_csv(tmp, index=False)
+        tmp.replace(out_path)
+    else:
+        df.to_csv(out_path, index=False)
+    logging.info(f"Event summary CSV saved: {out_path}")
+    return out_path
+
+def _write_manifest_json(site: str, events: List[Event], paths: Dict[str, Any], out_path: Path) -> Path:
+    payload = {
+        "site": site,
+        "events": [asdict(ev) for ev in events],
+        "paths": {k: str(v) if isinstance(v, Path) else v for k, v in paths.items()}
+    }
+    ensure_directory_exists(out_path.parent)
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+    tmp.replace(out_path)
+    logging.info(f"Manifest JSON saved: {out_path}")
+    return out_path
+
+# ---------------------------------------------------------------------------
+# Diagnostics: missing timestamps (TXT) and dropped wet segments (CSV)
+# ---------------------------------------------------------------------------
+
+def _infer_step_seconds(ts: pd.Series) -> float:
+    """Infer nominal step (seconds) from positive diffs; fallback: 60s."""
+    dt = pd.to_datetime(ts, errors="coerce")
+    diffs = dt.diff().dt.total_seconds().dropna()
+    diffs = diffs[diffs > 0]
+    return float(np.median(diffs)) if not diffs.empty else 60.0
+
+def summarize_missing_timestamps(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return a table of gaps with columns:
+      start_time, end_time, gap_seconds, nominal_step_s, missing_count
+    """
+    if "Datetime" not in df.columns:
+        return pd.DataFrame(columns=["start_time", "end_time", "gap_seconds", "nominal_step_s", "missing_count"])
+    t = pd.to_datetime(df["Datetime"], errors="coerce").dropna().sort_values().reset_index(drop=True)
+    if len(t) < 2:
+        return pd.DataFrame(columns=["start_time", "end_time", "gap_seconds", "nominal_step_s", "missing_count"])
+    step_s = _infer_step_seconds(t)
+    diffs = t.diff().dt.total_seconds().fillna(0.0)
+    gaps = diffs[diffs > 1.5 * step_s]  # bigger than 1.5× nominal step counts as a gap
+    rows = []
+    for i in gaps.index:
+        start = t.iloc[i - 1]
+        end = t.iloc[i]
+        gap_s = float((end - start).total_seconds())
+        miss = max(0, int(round(gap_s / step_s)) - 1)
+        rows.append({
+            "start_time": start,
+            "end_time": end,
+            "gap_seconds": gap_s,
+            "nominal_step_s": step_s,
+            "missing_count": miss,
+        })
+    return pd.DataFrame(rows)
+
+def write_missing_timestamp_report_txt(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    period_start: Optional[str] = None,
+    period_end: Optional[str] = None,
+) -> Path:
+    """
+    Write a TXT report with:
+      - period dates
+      - nominal step
+      - expected vs observed samples in the period
+      - total missing and percentage for the whole period
+      - a per-gap listing
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if "Datetime" not in df.columns:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("No 'Datetime' column available.\n")
+        return out_path
+
+    t_all = pd.to_datetime(df["Datetime"], errors="coerce").dropna().sort_values().reset_index(drop=True)
+    if t_all.empty:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("No valid timestamps found.\n")
+        return out_path
+
+    step_s = _infer_step_seconds(t_all)
+
+    if period_start and period_end:
+        p0 = pd.to_datetime(period_start)
+        p1 = pd.to_datetime(period_end)
+    else:
+        p0 = t_all.iloc[0]
+        p1 = t_all.iloc[-1]
+
+    mask = (t_all >= p0) & (t_all <= p1)
+    t = t_all[mask].drop_duplicates()
+    if t.empty:
+        expected_count = int(((p1 - p0).total_seconds() // step_s) + 1)
+        observed_count = 0
+        missing_period = expected_count
+    else:
+        total_seconds = (p1 - p0).total_seconds()
+        expected_count = int(round(total_seconds / step_s)) + 1
+        observed_count = int(t.size)
+        missing_period = max(expected_count - observed_count, 0)
+
+    pct_missing = (missing_period / expected_count * 100.0) if expected_count > 0 else 0.0
+
+    gaps_df = summarize_missing_timestamps(df)
+    total_gap_missing = int(gaps_df["missing_count"].sum()) if not gaps_df.empty else 0
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("=== Missing Timestamp Report ===\n")
+        f.write(f"Period: {p0}  →  {p1}\n")
+        f.write(f"Nominal step (s): {int(step_s)}\n")
+        f.write(f"Expected samples in period: {expected_count}\n")
+        f.write(f"Observed unique timestamps: {observed_count}\n")
+        f.write(f"Missing in period: {missing_period}\n")
+        f.write(f"Missing percentage (period): {pct_missing:.3f}%\n")
+        f.write(f"Sum of per-gap 'missing_count': {total_gap_missing}\n")
+        f.write("\n--- Gaps (start, end, gap_seconds, missing_count) ---\n")
+        if gaps_df.empty:
+            f.write("No gaps detected.\n")
         else:
-            logging.warning(f"No matrices combined for Event {event_id}")
+            for _, r in gaps_df.iterrows():
+                f.write(f"{r['start_time']}, {r['end_time']}, {int(r['gap_seconds'])} s, miss={int(r['missing_count'])}\n")
 
-    return df, event_count
+    return out_path
 
-def validate_results(df: pd.DataFrame, event_count: int) -> None:
+def summarize_dropped_wet_segments(
+    annotated: pd.DataFrame,
+    *,
+    min_duration_min: float,
+    min_accum_mm: float,
+    require_both_filters: bool,
+) -> pd.DataFrame:
     """
-    Validate the results of precipitation event identification.
-
-    Parameters:
-    - df (pd.DataFrame): Annotated DataFrame with 'Precip_Event' and 'Precip_Active' columns.
-    - event_count (int): Total number of precipitation events identified.
+    From the annotated dataframe (Datetime, event_id, is_raining, and either
+    Depth_mm or accum_from_rate_mm), list wet segments that ended up with
+    event_id == -1 and explain why they were dropped.
     """
-    required_columns = {'Precip_Event', 'Precip_Active', 'Datetime'}
-    if not required_columns.issubset(df.columns):
-        missing = required_columns - set(df.columns)
-        logging.error(f"DataFrame is missing required columns for validation: {missing}")
-        raise ValueError(f"Missing required columns: {missing}")
+    df = annotated.copy()
+    df["Datetime"] = pd.to_datetime(df["Datetime"], errors="coerce")
+    df = df.sort_values("Datetime").reset_index(drop=True)
 
-    # Check if event_count is logical
-    if event_count < 1:
-        logging.info("No precipitation events identified.")
+    # Choose per-sample depth series
+    if "Depth_mm" in df.columns:
+        depth = pd.to_numeric(df["Depth_mm"], errors="coerce").fillna(0.0)
+    elif "accum_from_rate_mm" in df.columns:
+        depth = pd.to_numeric(df["accum_from_rate_mm"], errors="coerce").fillna(0.0)
     else:
-        logging.info(f"Successfully identified {event_count} precipitation event(s).")
+        depth = integrate_rate_to_depth_mm(
+            df, time_col="Datetime", rate_col="Intensidad", cap_gap_minutes=30
+        ).fillna(0.0)
 
-    # Check for overlapping events (shouldn't happen)
-    overlapping = df[(df['Precip_Event'].duplicated(keep=False)) & (df['Precip_Active'])]
-    if not overlapping.empty:
-        overlapping_events = overlapping['Precip_Event'].unique()
-        logging.warning(f"Warning: Overlapping detected in events: {overlapping_events}")
-        logging.warning(overlapping[['Datetime', 'Precip_Event']])
-    else:
-        logging.info("No overlapping events detected.")
+    wet = df["is_raining"].fillna(False).astype(bool).values
+    evt = df["event_id"].fillna(-1).astype(int).values
+    rate = pd.to_numeric(df.get("Intensidad", 0.0), errors="coerce").fillna(0.0)
 
-    # Additional validation checks can be added here
+    def _segments(mask: np.ndarray) -> List[Tuple[int, int]]:
+        m = mask.astype(int)
+        dm = np.diff(np.concatenate(([0], m, [0])))
+        starts = np.where(dm == 1)[0]
+        ends = np.where(dm == -1)[0] - 1
+        return list(zip(starts, ends))
 
+    rows = []
+    for s, e in _segments(wet):
+        if np.all(evt[s:e + 1] == -1):
+            block_idx = slice(s, e + 1)
+            start = df["Datetime"].iloc[s]
+            end = df["Datetime"].iloc[e]
+            dur_min = (end - start).total_seconds() / 60.0 if pd.notna(start) and pd.notna(end) else 0.0
+            acc_mm = float(depth.iloc[block_idx].sum())
+            pass_dur = dur_min >= float(min_duration_min)
+            pass_acc = acc_mm >= float(min_accum_mm)
+
+            if require_both_filters:
+                reason_bits = []
+                if not pass_dur:
+                    reason_bits.append(f"duration<{min_duration_min}min")
+                if not pass_acc:
+                    reason_bits.append(f"accum<{min_accum_mm}mm")
+                reason = " & ".join(reason_bits) if reason_bits else "kept"
+            else:
+                reason = "duration&&accum both failed" if (not pass_dur and not pass_acc) else "kept"
+
+            rows.append({
+                "start_time": start,
+                "end_time": end,
+                "duration_min": dur_min,
+                "accum_mm": acc_mm,
+                "n_samples": int(e - s + 1),
+                "max_rate_mm_h": float(rate.iloc[block_idx].max()),
+                "reason": reason,
+            })
+
+    return pd.DataFrame(rows)
+
+# ---------------------------------------------------------------------------
+# Orchestration helper used by scripts/event.py
+# ---------------------------------------------------------------------------
+
+def run_event_identification_for_site(
+    df_processed: pd.DataFrame,
+    *,
+    cfg: Dict[str, Any],
+    site: str,
+    processed_site_dir: Path,
+    events_site_dir: Path,
+) -> Dict[str, Any]:
+    """
+    Identify events and write outputs according to config for a single site.
+    Returns a summary dict with paths and counts.
+    """
+    ev_cfg = cfg.get("events", {}) or {}
+    fnpat = (cfg.get("io", {}) or {}).get("filename_patterns", {}) or {}
+    matrix_size_cfg = (cfg.get("processing", {}) or {}).get("parsivel", {}).get("matrix_size", [32, 32])
+    matrix_size = int(matrix_size_cfg[0]) if isinstance(matrix_size_cfg, (list, tuple)) else int(matrix_size_cfg)
+
+    # Thresholds & rules
+    intensity_threshold = float(ev_cfg.get("intensity_threshold_mm_h", 0.1))
+    start_thr = ev_cfg.get("start_threshold_mm_h")
+    stop_thr = ev_cfg.get("stop_threshold_mm_h")
+    min_wet_streak = int(ev_cfg.get("min_wet_streak", 1))
+    min_dry_streak = int(ev_cfg.get("min_dry_streak", 1))
+    max_gap_for_rate = ev_cfg.get("max_gap_for_rate_integration_min", None)
+    max_gap_for_rate = float(max_gap_for_rate) if max_gap_for_rate not in (None, "") else None
+
+    min_duration_min = int(ev_cfg.get("min_duration_min", 10))
+    min_gap_min = int(ev_cfg.get("min_gap_min", 30))
+    min_accum_mm = float(ev_cfg.get("min_accum_mm", 0.2))
+    merge_if_gap_min = ev_cfg.get("merge_if_gap_min")
+    merge_if_gap_min = int(merge_if_gap_min) if merge_if_gap_min not in (None, "") else None
+    require_both_filters = bool(ev_cfg.get("require_both_filters", True))
+
+    safe_write = bool((cfg.get("io", {}) or {}).get("safe_writes", True))
+
+    # Identify events
+    annotated, events = identify_precipitation_events(
+        df_processed,
+        intensity_threshold_mm_h=intensity_threshold,
+        min_duration_min=min_duration_min,
+        min_gap_min=min_gap_min,
+        min_accum_mm=min_accum_mm,
+        merge_if_gap_min=merge_if_gap_min,
+        start_threshold_mm_h=start_thr,
+        stop_threshold_mm_h=stop_thr,
+        min_wet_streak=min_wet_streak,
+        min_dry_streak=min_dry_streak,
+        max_gap_for_rate_integration_min=max_gap_for_rate,
+        require_both_filters=require_both_filters,
+        site=site,
+    )
+
+    # Prepare dirs
+    ensure_directory_exists(events_site_dir)
+    matrices_dir = processed_site_dir / "matrices"
+
+    # Save annotated and event CSVs
+    annotated_path = save_annotated_data(annotated, events_site_dir, safe_write=safe_write)
+    event_csv_pat = fnpat.get("event_csv", "event_{id}.csv")
+    event_csv_paths = extract_and_save_events(annotated, events, events_site_dir, filename_pattern=event_csv_pat, safe_write=safe_write)
+
+    # Save combined matrices according to config flags
+    result: Dict[str, Any] = {
+        "site": site,
+        "annotated_csv": annotated_path,
+        "event_csvs": event_csv_paths,
+        "events": events,
+        "combined_event_matrices": [],
+        "combined_period_matrix": None,
+        "summary_csv": None,
+        "manifest_json": None,
+    }
+
+    out_flags = (ev_cfg.get("outputs", {}) or {})
+    combine_mode = (out_flags.get("matrix_combine", "sum") or "sum").lower()
+
+    if out_flags.get("save_per_event_combined", True):
+        for ev in events:
+            out_npy_name = fnpat.get("combined_npy", "combined_event_{id}.npy").format(id=ev.id)
+            out_npy_path = events_site_dir / out_npy_name
+            try:
+                saved = save_combined_event_matrix(
+                    matrices_dir=matrices_dir,
+                    event=ev,
+                    out_path=out_npy_path,
+                    matrix_size=matrix_size,
+                    safe_write=safe_write,
+                    mode=combine_mode,
+                )
+                if saved:
+                    result["combined_event_matrices"].append(saved)
+            except Exception as e:
+                logging.error(f"[{site}] Failed to save combined matrix for event {ev.id}: {e}", exc_info=True)
+
+    if out_flags.get("save_period_combined", True):
+        ts = pd.to_datetime(df_processed["Datetime"], errors="coerce")
+        ts_min = int(ts.min().timestamp())
+        ts_max = int(ts.max().timestamp())
+        out_name = fnpat.get("combined_period_npy", "combined_period_{start}_{end}.npy").format(
+            start=pd.to_datetime(ts_min, unit="s").strftime("%Y%m%d%H%M%S"),
+            end=pd.to_datetime(ts_max, unit="s").strftime("%Y%m%d%H%M%S"),
+        )
+        out_path = events_site_dir / out_name
+        try:
+            result["combined_period_matrix"] = save_combined_period_matrix(
+                matrices_dir=matrices_dir,
+                start_ts=ts_min,
+                end_ts=ts_max,
+                out_path=out_path,
+                matrix_size=matrix_size,
+                safe_write=safe_write,
+                mode=combine_mode,
+            )
+        except Exception as e:
+            logging.error(f"[{site}] Failed to save combined period matrix: {e}", exc_info=True)
+
+    # Summaries
+    try:
+        result["summary_csv"] = _write_event_summary_csv(events, events_site_dir / "event_summary.csv", safe_write=safe_write)
+        result["manifest_json"] = _write_manifest_json(
+            site=site,
+            events=events,
+            paths={
+                "annotated": annotated_path,
+                "event_csvs": [str(p) for p in event_csv_paths],
+                "combined_event_npys": [str(p) for p in result["combined_event_matrices"]],
+                "combined_period_npy": str(result["combined_period_matrix"]) if result["combined_period_matrix"] else None,
+            },
+            out_path=events_site_dir / "manifest.json",
+        )
+    except Exception as e:
+        logging.error(f"[{site}] Failed to write summaries: {e}", exc_info=True)
+
+    # Missing timestamps (TXT) — period-level percentage using config dates if present
+    try:
+        period_start = str((cfg.get("start_date") or "")) or None
+        period_end = str((cfg.get("end_date") or "")) or None
+        miss_txt = events_site_dir / "missing_timestamps.txt"
+        write_missing_timestamp_report_txt(
+            df_processed,
+            miss_txt,
+            period_start=period_start,
+            period_end=period_end,
+        )
+        logging.info(f"[{site}] Missing timestamps report saved: {miss_txt}")
+    except Exception as e:
+        logging.error(f"[{site}] Failed to write missing_timestamps.txt: {e}", exc_info=True)
+
+    # Dropped wet segments diagnostics
+    try:
+        drop_df = summarize_dropped_wet_segments(
+            annotated,
+            min_duration_min=float(ev_cfg.get("min_duration_min", 10)),
+            min_accum_mm=float(ev_cfg.get("min_accum_mm", 0.2)),
+            require_both_filters=bool(ev_cfg.get("require_both_filters", True)),
+        )
+        drop_csv = events_site_dir / "dropped_wet_segments.csv"
+        drop_df.to_csv(drop_csv, index=False)
+        logging.info(f"[{site}] Dropped wet segments: {len(drop_df)} (saved {drop_csv})")
+
+        mask = (annotated["is_raining"] == True) & (annotated["event_id"] == -1)
+        raw_csv = events_site_dir / "wet_but_not_in_event_samples.csv"
+        annotated.loc[mask].to_csv(raw_csv, index=False)
+        logging.info(f"[{site}] Wet samples not in event: {mask.sum()} (saved {raw_csv})")
+    except Exception as e:
+        logging.error(f"[{site}] Diagnostics export failed: {e}", exc_info=True)
+
+    logging.info(f"[{site}] Events found: {len(events)}")
+    return result

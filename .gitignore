@@ -28,6 +28,16 @@ data/**/*.csv
 !data/**/README.md
 !data/**/samples/**
 
+# Carpeta de crudos: ignora todo salvo samples/documentación
+data/raw/**/*
+!data/raw/**/samples/**
+!data/raw/**/README.md
+!data/raw/**/.gitkeep
+
+# ── Outputs/diagnósticos nuevos del app ───────────────────────────────────────
+data/**/events/**/missing_timestamps.txt
+data/**/events/**/manifest.json
+
 # ── Plots ─────────────────────────────────────────────────────────────────────
 plots/
 !plots/.gitkeep
@@ -61,11 +71,10 @@ desktop.ini
 *.so
 
 # ── Config local (no subir secretos) ──────────────────────────────────────────
+config/config.yaml
 config/*.local.yaml
-src/scripts/caso_prueba.py
-src/scripts/gamma_plot.py
-src/scripts/gamma.py
-scripts/caso_prueba.py
-scripts/gamma_plot.py
-scripts/gamma.py
-dash_app.py
+!config/config.example.yaml
+
+# ── Temporales / safe-writes ──────────────────────────────────────────────────
+*.tmp
+*.tmp.*

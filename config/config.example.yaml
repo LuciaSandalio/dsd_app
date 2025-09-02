@@ -1,0 +1,187 @@
+start_date: '2025-02-01'
+end_date: '2025-02-28'
+timezone: America/Argentina/Cordoba
+paths:
+  base_dir: .
+  raw_dir: data/raw
+  processed_dir: data/processed
+  events_dir: data/processed/events
+  plots_dir: plots
+  logs_dir: logs
+  diam_vel_mapping: diam_vel_mapping.csv
+run:
+  timezone: America/Argentina/Cordoba
+  sites:
+  - bosque_alegre
+  - villa_dique
+  - pilar
+sites:
+  bosque_alegre:
+    label: Bosque Alegre
+    timezone: America/Argentina/Cordoba
+    raw_glob: data/raw/bosque_alegre/**/*
+  villa_dique:
+    label: Villa Dique
+    timezone: America/Argentina/Cordoba
+    raw_glob: data/raw/villa_dique/**/*
+  pilar:
+    label: Pilar
+    timezone: America/Argentina/Cordoba
+    raw_glob: data/raw/pilar/**/*
+processing:
+  parallel:
+    max_workers: 4
+    chunk_size: 5000
+  parsivel:
+    matrix_size:
+    - 32
+    - 32
+    bin_centers:
+      diameters_mm:
+      - 0.06
+      - 0.19
+      - 0.31
+      - 0.44
+      - 0.56
+      - 0.69
+      - 0.81
+      - 0.94
+      - 1.06
+      - 1.19
+      - 1.38
+      - 1.63
+      - 1.88
+      - 2.13
+      - 2.38
+      - 2.75
+      - 3.25
+      - 3.75
+      - 4.25
+      - 4.75
+      - 5.5
+      - 6.5
+      - 7.5
+      - 8.5
+      - 9.5
+      - 11.0
+      - 13.0
+      - 15.0
+      - 17.0
+      - 19.0
+      - 21.5
+      - 24.5
+      velocities_m_s:
+      - 0.05
+      - 0.15
+      - 0.25
+      - 0.35
+      - 0.45
+      - 0.55
+      - 0.65
+      - 0.75
+      - 0.85
+      - 0.95
+      - 1.1
+      - 1.3
+      - 1.5
+      - 1.7
+      - 1.9
+      - 2.2
+      - 2.6
+      - 3.0
+      - 3.4
+      - 3.8
+      - 4.4
+      - 5.2
+      - 6.0
+      - 6.8
+      - 7.6
+      - 8.8
+      - 10.4
+      - 12.0
+      - 13.6
+      - 15.2
+      - 17.6
+      - 20.8
+    expect_units:
+      intensidad: mm/h
+      velocidad: m/s
+      diametro: mm
+  qc:
+    min_particles: 1
+    valid_sensor_states:
+    - 0
+    clip:
+      diametro_mm:
+      - 0.062
+      - 25
+      velocidad_ms:
+      - 0.0
+      - 20.0
+    na_policy: drop_row
+events:
+  intensity_threshold_mm_h: 0.1
+  min_duration_min: 10
+  min_gap_min: 30
+  min_accum_mm: 0.2
+  merge_if_gap_min: 5
+  outputs:
+    save_per_event_combined: true
+    save_period_combined: true
+    matrix_combine: sum
+  start_threshold_mm_h: 0.2
+  stop_threshold_mm_h: 0.05
+  min_wet_streak: 2
+  min_dry_streak: 2
+  max_gap_for_rate_integration_min: 30
+  require_both_filters: true
+  start_date: '2025-02-01'
+  end_date: '2025-02-28'
+visualization:
+  hyetograph:
+    bin_minutes: 10
+  heatmap:
+    cmap: viridis
+    vmin: null
+    vmax: null
+  export:
+    formats:
+    - png
+    dpi: 150
+    tight_layout: true
+    per_event_subdirs: true
+io:
+  filename_patterns:
+    event_csv: event_{id}.csv
+    combined_npy: combined_event_{id}.npy
+    combined_period_npy: combined_period_{start}_{end}.npy
+  safe_writes: true
+  append_csv: true
+logging:
+  level: INFO
+  rotation:
+    max_mb: 10
+    backup_count: 5
+cleanup:
+  enabled: true
+  when: always
+  dry_run: true
+  keep_patterns:
+  - '**/.gitkeep'
+  - '**/README.md'
+  targets:
+  - name: plots
+    path: plots
+    patterns:
+    - '**/*'
+  - name: events
+    path: data/processed/events
+    patterns:
+    - '**/*'
+  - name: matrices_per_site
+    paths:
+    - data/processed/bosque_alegre/matrices
+    - data/processed/villa_dique/matrices
+    - data/processed/pilar/matrices
+    patterns:
+    - '**/*'

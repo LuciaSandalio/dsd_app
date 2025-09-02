@@ -1,250 +1,171 @@
-#!/usr/bin/env python3
-# visualization_dsd.py
-# Generates visualization plots for precipitation events
-
-import sys
-import argparse
+# scripts/visualization_dsd.py
 import logging
 from pathlib import Path
-from typing import List, Tuple, Dict, Union
+import json
 import pandas as pd
 import numpy as np
-from tqdm import tqdm
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
+# Make local package importable no matter where we run from
+HERE = Path(__file__).resolve().parent
+SRC_ROOT = HERE.parent
+if str(SRC_ROOT) not in __import__('sys').path:
+    __import__('sys').path.insert(0, str(SRC_ROOT))
 
-# Ensure project root is on sys.path for module imports
-project_root = Path(__file__).parent.parent.parent.resolve()  
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-
-# Import custom modules
-from modules.utils import (
-    setup_initial_logging,
-    configure_logging,
-    load_config,
-    ensure_directory_exists
-)
+from modules.utils import ensure_directory_exists, load_config  # type: ignore
 from modules.visualization import (
-    resource_path,
-    create_plots_output_directories,
-    load_diam_vel_mapping_csv,
-    plot_precipitation_intensity_separate,
     plot_hyetograph,
+    plot_precipitation_intensity_separate,
     plot_accumulated_precipitation,
     plot_size_distribution,
     plot_velocity_distribution,
-    plot_velocity_diameter_heatmap
+    plot_velocity_diameter_heatmap,
+    load_diam_vel_mapping_from_config,
 )
 
+# ----------------------------- logging ---------------------------------
+LOGS_DIR = SRC_ROOT / "logs"
+ensure_directory_exists(LOGS_DIR)
+LOG_FILE = LOGS_DIR / "visualization.log"
 
-def process_event(
-    event_id_int: int,
-    df_event: pd.DataFrame,
-    dirs: Dict[str, Path],
-    diameters: List[float],
-    velocities: List[float],
-    combined_matrices_dir: Path,
-    accumulation_intervals: List[int]
-) -> Tuple[int, bool]:
-    """
-    Processes a single precipitation event by generating relevant plots.
-    """
+logger = logging.getLogger("visualization_dsd")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    sh = logging.StreamHandler()
+    fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    fh.setFormatter(fmt); sh.setFormatter(fmt)
+    logger.addHandler(fh); logger.addHandler(sh)
+
+# ------------------------- path resolution ------------------------------
+def _resolve_to_src_root(p: Path) -> Path:
+    return p if p.is_absolute() else (SRC_ROOT / p)
+
+def _find_events_root(cfg: dict) -> Path:
+    # 1) try config
+    processed_dir = Path((cfg.get("io", {}) or {}).get("processed_dir", "data/processed"))
+    candidate = _resolve_to_src_root(processed_dir) / "events"
+    candidates = [candidate]
+
+    # 2) common fallbacks
+    candidates += [
+        SRC_ROOT / "data" / "processed" / "events",
+        SRC_ROOT.parent / "data" / "processed" / "events",
+    ]
+
+    for c in candidates:
+        if c.exists():
+            return c
+
+    # 3) last resort: search
+    found = list(SRC_ROOT.rglob("events"))
+    if found:
+        return found[0]
+    return candidate  # return the main guess so the error message is clear
+
+
+# ----------------------------- main ------------------------------------
+def main() -> None:
+    # Config is optional; we only use it to guess paths
+    cfg_path = SRC_ROOT / "config" / "config.yaml"
     try:
-        # Drop NaN 'Intensidad'
-        df_event = df_event.dropna(subset=['Intensidad'])
-        if df_event.empty:
-            logging.warning(f"All 'Intensidad' values are NaN for Event {event_id_int}. Skipping plots.")
-            return (event_id_int, False)
-        
-        # Aseguramos que exista la columna Datetime
-        df_event['Datetime'] = pd.to_datetime(df_event['Datetime'])
-        start_dt = df_event['Datetime'].min().strftime('%Y-%m-%d %H:%M')
-        end_dt   = df_event['Datetime'].max().strftime('%Y-%m-%d %H:%M')
-
-        # Plot precipitation intensity
-        plot_precipitation_intensity_separate(
-            df_event=df_event,
-            intervals=accumulation_intervals,
-            event_id=event_id_int,
-            start_date=start_dt,
-            end_date=end_dt,
-            save_dir=dirs['intensity_dir']
-        )
-
-        # Plot hyetograph
-        plot_hyetograph(
-            df_event=df_event,
-            event_id=event_id_int,
-            start_date=start_dt,
-            end_date=end_dt,
-            save_dir=dirs['hyetograph_dir']
-        )
-
-        # Plot accumulated precipitation
-        plot_accumulated_precipitation(
-            df_event=df_event,
-            event_id=event_id_int,
-            start_date=start_dt,
-            end_date=end_dt,
-            save_dir=dirs['intensity_dir']
-        )
-
-         # Load combined matrix
-        combined_matrix_path = combined_matrices_dir / f'combined_event_{event_id_int}.npy'
-        
-        if not combined_matrix_path.exists():
-            print(combined_matrices_dir)
-            logging.warning(f"Combined matrix not found for Event {event_id_int}: {combined_matrix_path}")
-            return (event_id_int, False)
-        combined_matrix = np.load(combined_matrix_path, allow_pickle=True)
-
-        # Validate shape
-        expected_shape = (len(velocities), len(diameters))
-        if combined_matrix.shape != expected_shape:
-            logging.warning(f"Matrix shape {combined_matrix.shape} != expected {expected_shape} for Event {event_id_int}")
-            return (event_id_int, False)
-
-        # Plot size distribution
-        plot_size_distribution(
-            combined_matrix=combined_matrix,
-            diameters=diameters,
-            event_id=event_id_int,
-            start_date=start_dt,
-            end_date=end_dt,
-            save_dir=dirs['size_dir']
-        )
-
-        # Plot velocity distribution
-        plot_velocity_distribution(
-            combined_matrix=combined_matrix,
-            velocities=velocities,
-            event_id=event_id_int,
-            start_date=start_dt,
-            end_date=end_dt,
-            save_dir=dirs['velocity_dir']
-        )
-
-        # Plot velocity-diameter heatmap
-        plot_velocity_diameter_heatmap(
-            combined_matrix=combined_matrix,
-            velocities=velocities,
-            diameters=diameters,
-            event_id=event_id_int,
-            start_date=start_dt,
-            end_date=end_dt,
-            save_dir=dirs['heatmap_dir']
-        )
-
-        return (event_id_int, True)
+        cfg = load_config(cfg_path) if cfg_path.exists() else {}
     except Exception as e:
-        logging.error(f"Error processing Event {event_id_int}: {e}", exc_info=True)
-        return (event_id_int, False)
+        logger.warning(f"Could not read config at {cfg_path}: {e}")
+        cfg = {}
 
-def visualization_main(
-    start_date: str = None,
-    end_date: str = None,
-    config_path: str = "config/config.yaml"
-):
-    """
-    Loop over each location’s annotated CSV and generate plots.
-    """
-    # 1. Early console logging
-    setup_initial_logging()
+    events_root = _find_events_root(cfg)
+    if not events_root.exists():
+        logger.error(f"No events directory found at {events_root}")
+        return
 
-    # 2. Load configuration and set up logging
-    config = load_config(config_path)
-    viz_cfg = config.get('visualization', {})
-    log_file = viz_cfg.get('log_file_path', project_root / 'logs' / 'visualization.log')
-    ensure_directory_exists(Path(log_file).parent)
-    configure_logging(str(log_file))
-    logging.info("Visualization Workflow Started.")
+    logger.info(f"Events root: {events_root}")
 
-    # 3. Resolve key directories relative to project root
-    # Base directory containing per-location subfolders with annotated_data.csv
-    annotated_input_dir_cfg = viz_cfg.get('annotated_input_dir', 'data/processed')
-    annotated_base = (project_root / annotated_input_dir_cfg).resolve()
+    parsivel = (cfg.get("processing", {}) or {}).get("parsivel", {}) or {}
+    ms = parsivel.get("matrix_size", [32, 32])
+    matrix_size = ms[0] if isinstance(ms, (list, tuple)) else int(ms)
 
-    # Directory where combined matrices were saved per-location
-    events_base = (project_root / viz_cfg.get('event_directory',
-                                          'data/processed/events')).resolve()
-    
-    
-    plots_root_cfg = viz_cfg.get('plots_output_dir', 'plots')
-    plots_root = (project_root / plots_root_cfg).resolve()
+    diameters, velocities = load_diam_vel_mapping_from_config(cfg, expected_matrix_size=matrix_size)
 
-    # 4. Load diameter-velocity mapping
+    # Iterate every site folder under events/
+    sites = [p for p in events_root.iterdir() if p.is_dir()]
+    if not sites:
+        logger.error(f"No site folders found under {events_root}")
+        return
 
-    mapping_cfg = viz_cfg.get('diam_vel_mapping_file', 'diam_vel_mapping.csv')
-    diam_vel_mapping_file = (project_root / mapping_cfg).resolve()
-    logging.debug(f"Resolved diam-vel mapping file to: {diam_vel_mapping_file}")
+    for site_dir in sites:
+        site = site_dir.name
+        logger.info(f"[{site}] Starting plots…")
 
+        # event list: prefer manifest, else glob CSVs
+        manifest = site_dir / "manifest.json"
+        event_ids: list[int] = []
+        if manifest.exists():
+            try:
+                with open(manifest, "r", encoding="utf-8") as f:
+                    man = json.load(f)
+                event_ids = [int(e["id"]) for e in man.get("events", [])]
+            except Exception as e:
+                logger.warning(f"[{site}] Could not parse manifest.json: {e}")
 
-    diameters, velocities = load_diam_vel_mapping_csv(str(diam_vel_mapping_file))
+        if not event_ids:
+            event_ids = []
+            for csv in sorted(site_dir.glob("event_*.csv")):
+                try:
+                    eid = int(csv.stem.split("_")[1])
+                    event_ids.append(eid)
+                except Exception:
+                    pass
 
-    # 5. Set accumulation intervals Set accumulation intervals
-    accumulation_intervals = [1, 5, 10, 15, 30, 60]
-
-    # 6. Iterate per-location subfolder
-    for loc_dir in annotated_base.iterdir():
-        if not loc_dir.is_dir():
-            continue
-        location = loc_dir.name
-        annotated_csv = loc_dir / 'annotated_data.csv'
-        combined_matrices_dir = events_base / location
-        if not annotated_csv.exists():
-            logging.warning(f"Annotated CSV not found for {location}")
+        if not event_ids:
+            logger.info(f"[{site}] No events to plot.")
             continue
 
-        df_annot = pd.read_csv(annotated_csv, parse_dates=['Datetime'])
-        if 'Precip_Event' not in df_annot.columns:
-            logging.warning(f"No Precip_Event column in {location}'s annotated data")
-            continue
+        # Output root
+        plots_root = SRC_ROOT / "plots" / site
+        ensure_directory_exists(plots_root)
 
-        logging.info(f"Generating plots for location: {location}")
-        plots_base = plots_root / location
-        dirs_map = create_plots_output_directories(plots_base)
+        for eid in event_ids:
+            out_dir = plots_root / f"Event_{eid}"
+            hyeto_dir = out_dir / "hyetographs"
+            heatmap_dir = out_dir / "heatmaps"
+            size_dir = out_dir / "size_distributions"
+            vel_dir = out_dir / "velocity_distributions"
+            for p in (hyeto_dir, heatmap_dir, size_dir, vel_dir):
+                ensure_directory_exists(p)
 
-        unique_events = df_annot['Precip_Event'].dropna().unique()
-        success = 0
-        failure = 0
-        with ProcessPoolExecutor() as executor:
-            futures = []
-            for eid in unique_events:
-                eid_int = int(eid)
-                df_event = df_annot[df_annot['Precip_Event'] == eid_int].copy()
-                futures.append(
-                    executor.submit(
-                        process_event,
-                        eid_int,
-                        df_event,
-                        dirs_map,
-                        diameters,
-                        velocities,
-                        combined_matrices_dir,
-                        accumulation_intervals
-                    )
-                )
-            for fut in tqdm(as_completed(futures), total=len(futures), desc=f"Plots {location}", unit="event"):
-                eid_int, ok = fut.result()
-                if ok:
-                    success += 1
-                else:
-                    failure += 1
+            # Load event CSV
+            ev_csv = site_dir / f"event_{eid}.csv"
+            if not ev_csv.exists():
+                logger.warning(f"[{site}] Missing CSV for event {eid}: {ev_csv}")
+                continue
 
-        logging.info(f"Finished {location}: {success} succeeded, {failure} failed.")
+            try:
+                df = pd.read_csv(ev_csv)
+            except Exception as e:
+                logger.warning(f"[{site}] Failed reading {ev_csv}: {e}")
+                continue
 
-    logging.info("Visualization Workflow Completed.")
+            # --- Time-series plots ---
+            plot_hyetograph(df, event_id=eid, save_dir=hyeto_dir)
+            plot_precipitation_intensity_separate(df, [10, 60], event_id=eid, save_dir=hyeto_dir)
+            plot_accumulated_precipitation(df, event_id=eid, save_dir=hyeto_dir)
 
+            # --- Matrix-based plots (if NPY present) ---
+            npy = site_dir / f"combined_event_{eid}.npy"
+            if npy.exists():
+                try:
+                    M = np.load(npy)
+                    plot_size_distribution(M, diameters or [], event_id=eid, save_dir=size_dir)
+                    plot_velocity_distribution(M, velocities or [], event_id=eid, save_dir=vel_dir)
+                    plot_velocity_diameter_heatmap(M, velocities or [], diameters or [], event_id=eid, save_dir=heatmap_dir)
+                except Exception as e:
+                    logger.warning(f"[{site}] Could not load/plot matrix for event {eid}: {e}")
+            else:
+                logger.info(f"[{site}] No combined matrix for event {eid} (skipping heatmap/distributions).")
 
-def _cli_entry_point():
-    parser = argparse.ArgumentParser(description="Visualization for DSD events per location.")
-    parser.add_argument('--config', default="config/config.yaml", help="Path to config.")
-    parser.add_argument('--start-date', help="Override start date (YYYY-MM-DD).")
-    parser.add_argument('--end-date', help="Override end date (YYYY-MM-DD).")
-    args = parser.parse_args()
-    visualization_main(args.start_date, args.end_date, args.config)
+        logger.info(f"[{site}] Done. Plots under {plots_root}")
+
+    logger.info("All sites completed.")
 
 if __name__ == "__main__":
-    _cli_entry_point()
+    main()

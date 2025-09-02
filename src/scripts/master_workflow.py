@@ -1,126 +1,110 @@
+#!/usr/bin/env python3
 # scripts/master_workflow.py
 
 import sys
 from pathlib import Path
-import subprocess
 import argparse
-import yaml
 import logging
+from typing import Optional
 import pandas as pd
+import yaml
 
-# Correctly determine project root by going up three levels
-project_root = Path(__file__).parent.parent.parent.resolve()
-print(f"Project root: {project_root}")
+# ── Path setup ────────────────────────────────────────────────────────────────
+_THIS = Path(__file__).resolve()
+SRC_DIR = _THIS.parents[1]          # /.../dsd_app/src
+PROJ_ROOT = _THIS.parents[2]        # /.../dsd_app
 
-# Insert project_root into sys.path if not already present
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-    print(f"Inserted {project_root} into sys.path")
+print(f"Project root: {PROJ_ROOT}")
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+if str(PROJ_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJ_ROOT))
 
-# Import from modules after setting up sys.path and logging
 from modules.utils import cleanup_output, configure_logging, load_config
-
 from scripts.get_dsdfile import get_dsdfile_main
 from scripts.event import event_main
-from scripts.visualization_dsd import visualization_main
+# (viz is lazy-imported only if enabled)
 
-def run_script(script_path, args=[]):
-    """
-    Runs a Python script with the given arguments.
-    """
-    try:
-        command = [sys.executable, script_path] + args
-        logging.info(f"Running script: {' '.join(command)}")
-        subprocess.run(command, check=True)
-        logging.info(f"Successfully ran {script_path}")
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Error running {script_path}: {e}")
-        sys.exit(1)
+# ── Helpers ──────────────────────────────────────────────────────────────────
+def _set_dates_in_config(config_path: Path, start_date: str, end_date: str) -> None:
+    cfg = {}
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    # flat + nested (compat)
+    cfg["start_date"] = start_date
+    cfg["end_date"]   = end_date
+    cfg.setdefault("get_dsdfile", {})
+    cfg["get_dsdfile"]["start_date"] = start_date
+    cfg["get_dsdfile"]["end_date"]   = end_date
+    cfg.setdefault("event", {})
+    cfg["event"]["start_date"] = start_date
+    cfg["event"]["end_date"]   = end_date
+    with open(config_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+    logging.info(f"Updated dates in {config_path}: {start_date} → {end_date}")
 
-def update_config_with_dates(config_path, start_date, end_date):
-    """
-    Updates the config.yaml file with the provided start and end dates.
-    """
-    try:
-        with open(config_path, 'r') as file:
-            config = yaml.safe_load(file)
-
-        config['get_dsdfile']['start_date'] = start_date
-        config['get_dsdfile']['end_date'] = end_date
-
-        config['event']['start_date'] = start_date
-        config['event']['end_date'] = end_date
-
-        config['visualization']['start_date'] = start_date
-        config['visualization']['end_date'] = end_date
-
-        with open(config_path, 'w') as file:
-            yaml.dump(config, file)
-
-        logging.info(f"Updated config.yaml with start_date: {start_date} and end_date: {end_date}")
-    except Exception as e:
-        logging.critical(f"Failed to update config.yaml: {e}")
-        sys.exit(1)
-
-def validate_dates(start_date, end_date):
-    """
-    Validates the format and logical order of the provided dates.
-    """
-    try:
-        start = pd.to_datetime(start_date)
-        end = pd.to_datetime(end_date)
-        if start > end:
-            logging.error("Start date must be earlier than or equal to end date.")
-            sys.exit(1)
-    except Exception as e:
-        logging.error(f"Date validation error: {e}")
-        sys.exit(1)
-
-def run_master_workflow(start_date: str, end_date: str, config_path: str(project_root / "config" / "config.yaml")) -> None: # type: ignore
-    """
-    Executes the master workflow for a given date range.
-    
-    Parameters:
-    - start_date (str): Start date in 'YYYY-MM-DD' format.
-    - end_date (str): End date in 'YYYY-MM-DD' format.
-    - config_path (str): Path to the configuration YAML file.
-    """
-    # Configure logging using the centralized function
-    try:
-        config = load_config(Path(config_path).resolve())
-        log_file_path = config.get('workflow', {}).get('log_file', 'logs/master_workflow.log')
-    except Exception as e:
-        print(f"Failed to load configuration for logging: {e}")
-        sys.exit(1)
-
+# ── Orchestrator ─────────────────────────────────────────────────────────────
+def run_master_workflow(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    config_path: str = str(PROJ_ROOT / "config" / "config.yaml"),
+    enable_visualization: bool = False,
+) -> None:
+    cfg = load_config(Path(config_path).resolve())
+    log_file_path = (cfg.get("workflow", {}) or {}).get(
+        "log_file", str(PROJ_ROOT / "logs" / "master_workflow.log")
+    )
     configure_logging(log_file_path)
+    logging.info("Master Workflow Started")
 
-    logging.info("Master Workflow Started.")
+    # If GUI passed dates, validate and write into config. Otherwise trust config.
+    if start_date and end_date:
+        s, e = pd.to_datetime(start_date), pd.to_datetime(end_date)
+        if s > e:
+            logging.critical("start_date must be <= end_date")
+            sys.exit(1)
+        _set_dates_in_config(Path(config_path), start_date, end_date)
+        cfg = load_config(Path(config_path).resolve())  # reload
 
-    # Update config.yaml with start and end dates
-    validate_dates(start_date, end_date)
-    update_config_with_dates(config_path, start_date, end_date)
+    # 0) Cleanup
+    cleanup_output(cfg)
+    logging.info("Cleanup completed.")
 
-    # Reload configuration after updating
-    try:
-        config = load_config(Path(config_path).resolve())
-    except Exception as e:
-        logging.error(f"Failed to reload configuration after updating dates: {e}")
-        sys.exit(1)
+    # 1) Raw -> processed
+    get_dsdfile_main(config_path)
 
-    # Step 0: Cleanup previous outputs
-    try:
-        cleanup_output(config)
-        logging.info("Cleanup of previous outputs completed.")
-    except Exception as e:
-        logging.critical(f"Failed during cleanup: {e}")
-        sys.exit(1)
+    # 2) Events
+    event_main(config_path)
 
-    get_dsdfile_main(start_date, end_date, config_path)
-    event_main(start_date, end_date, config_path)
-    visualization_main(start_date, end_date, config_path)
+    # 3) Visualization (optional)
+    if enable_visualization:
+        try:
+            from scripts.visualization_dsd import main as visualization_cli
+            logging.info("Running visualization stage…")
+            rc = visualization_cli()
+            if rc != 0:
+                logging.error(f"Visualization returned {rc}")
+        except Exception:
+            logging.exception("Visualization failed (skipped).")
 
     logging.info("Master Workflow Completed Successfully.")
     print("Master workflow completed successfully.")
 
+# ── CLI ──────────────────────────────────────────────────────────────────────
+def _parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Run DSD master workflow (reads dates from config)")
+    ap.add_argument("--config", default=str(PROJ_ROOT / "config" / "config.yaml"))
+    ap.add_argument("--start-date")  # optional; GUI usually writes to config
+    ap.add_argument("--end-date")    # optional; GUI usually writes to config
+    ap.add_argument("--enable-visualization", action="store_true")
+    return ap.parse_args()
 
+if __name__ == "__main__":
+    args = _parse_args()
+    run_master_workflow(
+        start_date=args.start_date,
+        end_date=args.end_date,
+        config_path=args.config,
+        enable_visualization=args.enable_visualization,
+    )
