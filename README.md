@@ -35,9 +35,11 @@
     python src\scripts\get_dsdfile.py
 
     python src\scripts\event.py
-   **o todo junto:**
-    python src\scripts\master_workflow.py
     ```
+   **o todo junto:**
+   ```python
+    python src\scripts\master_workflow.py
+   ```
 
 **Notas de compatibilidad (Windows)**
 
