@@ -108,14 +108,3 @@ if __name__ == "__main__":
         config_path=args.config,
         enable_visualization=args.enable_visualization,
     )
-
-    # Seccion de parametrizacion
-    from event_parameterization.modulos.parametrizar_unico_evento import main as parametrizar_unico_evento
-    from event_parameterization.modulos.parametrizar_unico_evento_bucle import parametrizar_unico_evento_bucle
-
-    # Directorios
-    events_dir = "data/processed/events"
-    raw_dir = "data/raw"
-
-    # Funcion 
-    parametrizar_unico_evento_bucle.parametrizar_unico_evento_bucle(events_dir, raw_dir, parametrizar_unico_evento)
