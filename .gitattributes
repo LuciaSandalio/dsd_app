@@ -1,0 +1,9 @@
+* text=auto
+
+# Fuerza LF en archivos de código y datos de texto
+*.py   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.csv  text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf

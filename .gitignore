@@ -1,0 +1,80 @@
+# ── Python caches ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+
+# ── Entornos / variables ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# ── Build / distribución ──────────────────────────────────────────────────────
+build/
+dist/
+*.egg-info/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs/
+!logs/.gitkeep
+*.log
+
+# ── Datos generados ───────────────────────────────────────────────────────────
+data/**/*.npy
+data/**/*.csv
+# Mantener placeholders, docs y samples
+!data/**/.gitkeep
+!data/**/README.md
+!data/**/samples/**
+
+# Carpeta de crudos: ignora todo salvo samples/documentación
+data/raw/**/*
+!data/raw/**/samples/**
+!data/raw/**/README.md
+!data/raw/**/.gitkeep
+
+# ── Outputs/diagnósticos nuevos del app ───────────────────────────────────────
+data/**/events/**/missing_timestamps.txt
+data/**/events/**/manifest.json
+
+# ── Plots ─────────────────────────────────────────────────────────────────────
+plots/
+!plots/.gitkeep
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Testing / análisis estático ───────────────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.coverage
+
+# ── IDE / Editor ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+
+# ── Metadatos de SO ───────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Locks de editores (LibreOffice, etc.) ─────────────────────────────────────
+~lock.*#
+
+# ── Binarios/artefactos opcionales ────────────────────────────────────────────
+*.pkl
+*.so
+
+# ── Config local (no subir secretos) ──────────────────────────────────────────
+config/config.yaml
+config/*.local.yaml
+!config/config.example.yaml
+
+# ── Temporales / safe-writes ──────────────────────────────────────────────────
+*.tmp
+*.tmp.*
